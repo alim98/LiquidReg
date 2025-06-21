@@ -16,6 +16,7 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 import random
+import types
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -48,9 +49,6 @@ def create_model(config: dict) -> nn.Module:
     """Create model based on configuration."""
     model_config = config['model']
     
-    # Get gradient checkpointing setting from training config (default to False if not present)
-    use_gradient_checkpointing = config['training'].get('use_gradient_checkpointing', False)
-    
     if model_config['name'] == 'LiquidReg':
         model = LiquidReg(
             image_size=tuple(model_config['image_size']),
@@ -61,7 +59,6 @@ def create_model(config: dict) -> nn.Module:
             velocity_scale=model_config['velocity_scale'],
             num_squaring=model_config['num_squaring'],
             fusion_type=model_config['fusion_type'],
-            use_gradient_checkpointing=use_gradient_checkpointing,
         )
     elif model_config['name'] == 'LiquidRegLite':
         model = LiquidRegLite(
@@ -71,7 +68,6 @@ def create_model(config: dict) -> nn.Module:
             liquid_num_steps=model_config['liquid_num_steps'],
             velocity_scale=model_config['velocity_scale'],
             num_squaring=model_config['num_squaring'],
-            use_gradient_checkpointing=use_gradient_checkpointing,
         )
     else:
         raise ValueError(f"Unknown model: {model_config['name']}")
@@ -352,10 +348,18 @@ def main():
                        help='Path to configuration file')
     parser.add_argument('--data_root', type=str, default=None,
                        help='Override data root directory')
-    parser.add_argument('--subset_percent', type=float, default=100.0,
-                       help='Percentage of dataset to use (1.0 = 1%, 10.0 = 10%, 100.0 = full dataset)')
-    parser.add_argument('--memory_efficient', action='store_true',
-                       help='Enable memory-efficient mode with reduced batch size and model size')
+    parser.add_argument('--small_dataset', action='store_true',
+                       help='Use only 1% of the dataset for training (to reduce memory usage)')
+    parser.add_argument('--batch_size', type=int, default=None,
+                       help='Override batch size from config (to reduce memory usage)')
+    parser.add_argument('--lite', action='store_true',
+                       help='Use LiquidRegLite model instead of full LiquidReg (to reduce memory usage)')
+    parser.add_argument('--reduce_steps', action='store_true',
+                       help='Reduce the number of steps in the liquid ODE solver (to reduce memory usage)')
+    parser.add_argument('--gradient_checkpointing', action='store_true',
+                       help='Enable gradient checkpointing to save memory during training')
+    parser.add_argument('--small_encoder', action='store_true',
+                       help='Use a smaller encoder with fewer channels (to reduce memory usage)')
     
     args = parser.parse_args()
     
@@ -365,36 +369,39 @@ def main():
     # Override data root if provided
     if args.data_root:
         config['data']['data_root'] = args.data_root
-    
-    # Apply memory efficiency settings if requested
-    if args.memory_efficient:
-        # Reduce batch size
-        original_batch_size = config['data']['batch_size']
-        config['data']['batch_size'] = max(1, config['data']['batch_size'] // 2)
         
-        # Use smaller patch size
-        original_patch_size = config['data']['patch_size']
-        config['data']['patch_size'] = min(48, config['data']['patch_size'])
+    # Override batch size if provided
+    if args.batch_size is not None:
+        print(f"Overriding batch size: {config['data']['batch_size']} → {args.batch_size}")
+        config['data']['batch_size'] = args.batch_size
         
-        # Use fewer patches per pair
-        original_patches_per_pair = config['data']['patches_per_pair']
-        config['data']['patches_per_pair'] = max(5, config['data']['patches_per_pair'] // 2)
+    # Use lite model if requested
+    if args.lite:
+        print("Using LiquidRegLite model instead of full LiquidReg")
+        config['model']['name'] = "LiquidRegLite"
         
-        # Use smaller model if LiquidReg
-        if config['model']['name'] == 'LiquidReg':
-            config['model']['encoder_channels'] = min(128, config['model']['encoder_channels'])
-            config['model']['liquid_hidden_dim'] = min(32, config['model']['liquid_hidden_dim'])
+    # Reduce ODE steps if requested
+    if args.reduce_steps:
+        original_steps = config['model']['liquid_num_steps']
+        config['model']['liquid_num_steps'] = max(2, original_steps // 2)  # At least 2 steps
+        print(f"Reducing ODE steps: {original_steps} → {config['model']['liquid_num_steps']}")
         
-        # Enable gradient checkpointing to save memory
-        config['training']['use_gradient_checkpointing'] = True
+        # Also reduce squaring steps to save memory
+        original_squaring = config['model']['num_squaring']
+        config['model']['num_squaring'] = max(2, original_squaring - 2)  # At least 2 steps
+        print(f"Reducing squaring steps: {original_squaring} → {config['model']['num_squaring']}")
         
-        print(f"Memory-efficient mode enabled:")
-        print(f"  - Batch size: {original_batch_size} → {config['data']['batch_size']}")
-        print(f"  - Patch size: {original_patch_size} → {config['data']['patch_size']}")
-        print(f"  - Patches per pair: {original_patches_per_pair} → {config['data']['patches_per_pair']}")
-        print(f"  - Encoder channels: {config['model']['encoder_channels']}")
-        print(f"  - Liquid hidden dim: {config['model']['liquid_hidden_dim']}")
-        print(f"  - Gradient checkpointing: Enabled")
+    # Use smaller encoder if requested
+    if args.small_encoder:
+        original_channels = config['model']['encoder_channels']
+        config['model']['encoder_channels'] = original_channels // 2
+        print(f"Using smaller encoder: {original_channels} → {config['model']['encoder_channels']} channels")
+        
+        # Also reduce liquid hidden dimension
+        if 'liquid_hidden_dim' in config['model']:
+            original_hidden = config['model']['liquid_hidden_dim']
+            config['model']['liquid_hidden_dim'] = max(16, original_hidden // 2)
+            print(f"Reducing liquid hidden dim: {original_hidden} → {config['model']['liquid_hidden_dim']}")
     
     # Set random seed
     set_seed(config['seed'])
@@ -423,46 +430,37 @@ def main():
         num_workers=config['data']['num_workers']
     )
     
-    # Apply subset percentage if specified
-    if args.subset_percent < 100.0:
-        subset_fraction = args.subset_percent / 100.0
-        train_size = int(len(train_loader.dataset) * subset_fraction)
-        val_size = int(len(val_loader.dataset) * subset_fraction)
+    # If small_dataset flag is set, use only 1% of the dataset
+    if args.small_dataset:
+        print("Using small dataset (1% of the full dataset)")
+        # Create subset of the training data (1%)
+        train_size = len(train_loader.dataset)
+        small_size = max(1, int(train_size * 0.01))  # At least 1 sample
+        indices = torch.randperm(train_size)[:small_size]
+        train_subset = torch.utils.data.Subset(train_loader.dataset, indices)
         
-        # Create subset samplers
-        from torch.utils.data import SubsetRandomSampler
-        import numpy as np
-        
-        # For training data
-        train_indices = list(range(len(train_loader.dataset)))
-        np.random.shuffle(train_indices)
-        train_indices = train_indices[:train_size]
-        train_sampler = SubsetRandomSampler(train_indices)
-        
-        # For validation data
-        val_indices = list(range(len(val_loader.dataset)))
-        np.random.shuffle(val_indices)
-        val_indices = val_indices[:val_size]
-        val_sampler = SubsetRandomSampler(val_indices)
-        
-        # Recreate data loaders with samplers
+        # Create new DataLoader with the subset
         train_loader = torch.utils.data.DataLoader(
-            train_loader.dataset,
+            train_subset,
             batch_size=config['data']['batch_size'],
-            sampler=train_sampler,
+            shuffle=True,
             num_workers=config['data']['num_workers'],
             pin_memory=True
         )
+        
+        # Also reduce validation set size
+        val_size = len(val_loader.dataset)
+        small_val_size = max(1, int(val_size * 0.01))
+        val_indices = torch.randperm(val_size)[:small_val_size]
+        val_subset = torch.utils.data.Subset(val_loader.dataset, val_indices)
         
         val_loader = torch.utils.data.DataLoader(
-            val_loader.dataset,
+            val_subset,
             batch_size=config['data']['batch_size'],
-            sampler=val_sampler,
+            shuffle=False,
             num_workers=config['data']['num_workers'],
             pin_memory=True
         )
-        
-        print(f"Using {args.subset_percent}% of dataset: {train_size} training samples, {val_size} validation samples")
     
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
@@ -470,6 +468,33 @@ def main():
     # Create model
     model = create_model(config)
     model = model.to(device)
+    
+    # Enable gradient checkpointing if requested
+    if args.gradient_checkpointing:
+        print("Enabling gradient checkpointing to save memory")
+        # Enable gradient checkpointing for the model
+        if hasattr(model, 'encoder') and hasattr(model.encoder, 'encoder'):
+            model.encoder.encoder.gradient_checkpointing_enable()
+            print("Gradient checkpointing enabled for encoder")
+        if hasattr(model, 'liquid_core'):
+            # Custom gradient checkpointing for LiquidODECore
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+                return custom_forward
+            
+            # Monkey patch the forward method to use checkpointing
+            original_forward = model.liquid_core.forward
+            
+            def checkpointed_forward(self, coords, params):
+                return torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(original_forward),
+                    self, coords, params,
+                    preserve_rng_state=True
+                )
+            
+            model.liquid_core.forward = types.MethodType(checkpointed_forward, model.liquid_core)
+            print("Gradient checkpointing enabled for liquid_core")
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -507,6 +532,7 @@ def main():
     
     # Training loop
     early_stopping_counter = 0
+    best_loss = float('inf')  # Initialize best loss
     
     for epoch in range(config['training']['num_epochs']):
         print(f"\nEpoch {epoch}/{config['training']['num_epochs']}")
