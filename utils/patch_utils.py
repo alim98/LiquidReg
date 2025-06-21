@@ -54,9 +54,17 @@ def extract_patches(
                     patch = vol[:, d_start:d_end, h_start:h_end, w_start:w_end]
                     
                     # Check if patch contains enough foreground
-                    if patch.mean() > threshold:
-                        patches.append(patch)
-                        coordinates.append((d_center, h_center, w_center))
+                    # Convert to float for mean calculation if needed
+                    if patch.dtype == torch.long or patch.dtype == torch.int32 or patch.dtype == torch.int64:
+                        # For segmentation labels, check if there are any non-zero values
+                        if (patch > 0).sum() > 0:
+                            patches.append(patch)
+                            coordinates.append((d_center, h_center, w_center))
+                    else:
+                        # For intensity images, use mean threshold
+                        if patch.float().mean() > threshold:
+                            patches.append(patch)
+                            coordinates.append((d_center, h_center, w_center))
     
     return patches, coordinates
 
@@ -105,8 +113,16 @@ def extract_random_patches(
             
             patch = vol[:, d_start:d_end, h_start:h_end, w_start:w_end]
             
-            # Check validity
-            if patch.mean() > min_intensity:
+            # Check validity based on data type
+            is_valid = False
+            if patch.dtype == torch.long or patch.dtype == torch.int32 or patch.dtype == torch.int64:
+                # For segmentation labels, check if there are any non-zero values
+                is_valid = (patch > 0).sum() > 0
+            else:
+                # For intensity images, use mean threshold
+                is_valid = patch.float().mean() > min_intensity
+                
+            if is_valid:
                 patches.append(patch)
                 valid_patches += 1
             
@@ -276,14 +292,28 @@ def compute_patch_statistics(patches: List[torch.Tensor]) -> dict:
     # Stack patches
     patch_tensor = torch.stack(patches, dim=0)  # (N, C, D, H, W)
     
-    stats = {
-        "mean": patch_tensor.mean().item(),
-        "std": patch_tensor.std().item(),
-        "min": patch_tensor.min().item(),
-        "max": patch_tensor.max().item(),
-        "median": patch_tensor.median().item(),
-        "count": len(patches),
-        "shape": patch_tensor.shape[1:],  # (C, D, H, W)
-    }
+    # Convert to float for statistics if needed
+    if patch_tensor.dtype == torch.long or patch_tensor.dtype == torch.int32 or patch_tensor.dtype == torch.int64:
+        # For segmentation data, compute different statistics
+        stats = {
+            "mean": patch_tensor.float().mean().item(),
+            "non_zero_fraction": (patch_tensor > 0).float().mean().item(),
+            "unique_labels": torch.unique(patch_tensor).numel(),
+            "min": patch_tensor.min().item(),
+            "max": patch_tensor.max().item(),
+            "count": len(patches),
+            "shape": patch_tensor.shape[1:],  # (C, D, H, W)
+        }
+    else:
+        # For intensity data, compute standard statistics
+        stats = {
+            "mean": patch_tensor.mean().item(),
+            "std": patch_tensor.std().item(),
+            "min": patch_tensor.min().item(),
+            "max": patch_tensor.max().item(),
+            "median": patch_tensor.median().item(),
+            "count": len(patches),
+            "shape": patch_tensor.shape[1:],  # (C, D, H, W)
+        }
     
     return stats 
