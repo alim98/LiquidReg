@@ -185,7 +185,7 @@ def train_epoch(
             loss = losses['total']
         
         # Backward pass
-        if use_amp:
+        if use_amp and scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             
@@ -405,7 +405,17 @@ def main():
     )
     
     # Mixed precision scaler
-    scaler = GradScaler(enabled=config['training']['use_amp'])
+    # Use the updated GradScaler API
+    if config['training']['use_amp']:
+        try:
+            # Try new API first
+            scaler = GradScaler('cuda', enabled=config['training']['use_amp'])
+        except:
+            # Fallback to old API
+            from torch.cuda.amp import GradScaler as CudaGradScaler
+            scaler = CudaGradScaler(enabled=config['training']['use_amp'])
+    else:
+        scaler = None
     
     # Training loop
     early_stopping_counter = 0

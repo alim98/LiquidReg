@@ -203,12 +203,17 @@ class L2RTask3Dataset(Dataset):
 
         def _is_valid(p: torch.Tensor, frac: float = 0.10, thresh: float = 0.15) -> bool:
             """Return True if at least *frac* voxels are > *thresh*."""
-            if p.dtype == torch.long or p.dtype == torch.int32 or p.dtype == torch.int64:
-                # For segmentation data, check if there are enough non-zero voxels
-                return (p > 0).float().mean().item() > frac
-            else:
-                # For intensity data, use threshold
-                return (p > thresh).float().mean().item() > frac
+            try:
+                if p.dtype in [torch.long, torch.int32, torch.int64, torch.int, torch.int8, torch.int16]:
+                    # For integer data (segmentation data), check if there are enough non-zero voxels
+                    return (p > 0).float().mean().item() > frac
+                else:
+                    # For floating point data (intensity data), use threshold
+                    return (p > thresh).float().mean().item() > frac
+            except Exception as e:
+                # Fallback: consider patch valid
+                print(f"Warning: Error in patch validation ({e}), considering patch valid")
+                return True
 
         max_attempts = 20
         patch_idx = None
