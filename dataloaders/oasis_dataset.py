@@ -238,10 +238,19 @@ class L2RTask3Dataset(Dataset):
 
         # Optional data augmentation (train split only)
         if self.augment and self.augmentor is not None:
-            combined = torch.cat([fixed_patch, moving_patch], dim=1)
-            augmented = self.augmentor.augment(combined)
-            output["fixed"] = augmented[:, 0:1].squeeze(0)
-            output["moving"] = augmented[:, 1:2].squeeze(0)
+            # Apply the same augmentation to both images to maintain correspondence
+            # First, generate random augmentation parameters
+            import torch.nn.functional as F
+            
+            # Apply same spatial transformations to both patches
+            seed = torch.randint(0, 1000000, (1,)).item()
+            
+            # Set same random seed for both augmentations to ensure same transforms
+            torch.manual_seed(seed)
+            output["fixed"] = self.augmentor.augment(fixed_patch).squeeze(0)
+            
+            torch.manual_seed(seed)  # Reset to same seed
+            output["moving"] = self.augmentor.augment(moving_patch).squeeze(0)
 
         # Attach segmentation labels if available
         if self.use_labels and vol1["label"] is not None and vol2["label"] is not None:

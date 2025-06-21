@@ -165,7 +165,15 @@ def train_epoch(
         
         # Forward pass with mixed precision
         use_amp = config['training']['use_amp']
-        with autocast(enabled=use_amp):
+        try:
+            # Try new API first
+            autocast_context = autocast('cuda', enabled=use_amp)
+        except:
+            # Fallback to old API
+            from torch.cuda.amp import autocast as cuda_autocast
+            autocast_context = cuda_autocast(enabled=use_amp)
+        
+        with autocast_context:
             output = model(fixed, moving, return_intermediate=True)
             
             warped = output['warped_moving']
