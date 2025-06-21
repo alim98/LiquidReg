@@ -14,7 +14,7 @@ model:
 
 # Data Configuration
 data:
-  data_root: "/path/to/data"
+  data_root: "data"
   train_dir: "L2R_2021_Task3_train"
   val_dir: "L2R_2021_Task3_val"
   test_dir: null

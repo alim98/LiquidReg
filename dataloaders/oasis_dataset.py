@@ -8,8 +8,8 @@ import nibabel as nib
 import torch
 from torch.utils.data import Dataset
 
-from SpikeReg.utils.preprocessing import normalize_volume
-from SpikeReg.utils.patch_utils import extract_patches, PatchAugmentor
+from utils.preprocessing import normalize_volume
+from utils.patch_utils import extract_patches, PatchAugmentor
 
 
 def _read_pairs_csv(csv_path: Path) -> List[Tuple[int, int]]:
