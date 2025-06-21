@@ -229,10 +229,10 @@ class L2RTask3Dataset(Dataset):
         fixed_patch = fixed_patches[patch_idx]
         moving_patch = moving_patches[patch_idx]
             
-        # Prepare output dictionary
+        # Prepare output dictionary - keep channel dimension
         output = {
-            "fixed": fixed_patch.squeeze(0),
-            "moving": moving_patch.squeeze(0),
+            "fixed": fixed_patch,  # Keep as (1, 64, 64, 64)
+            "moving": moving_patch,  # Keep as (1, 64, 64, 64)
             "pair_idx": pair_idx,
         }
 
@@ -247,10 +247,10 @@ class L2RTask3Dataset(Dataset):
             
             # Set same random seed for both augmentations to ensure same transforms
             torch.manual_seed(seed)
-            output["fixed"] = self.augmentor.augment(fixed_patch).squeeze(0)
+            output["fixed"] = self.augmentor.augment(fixed_patch)  # Keep channel dimension
             
             torch.manual_seed(seed)  # Reset to same seed
-            output["moving"] = self.augmentor.augment(moving_patch).squeeze(0)
+            output["moving"] = self.augmentor.augment(moving_patch)  # Keep channel dimension
 
         # Attach segmentation labels if available
         if self.use_labels and vol1["label"] is not None and vol2["label"] is not None:
@@ -271,8 +271,8 @@ class L2RTask3Dataset(Dataset):
             if fixed_label_patches and patch_idx < len(fixed_label_patches):
                 fixed_label_patch = fixed_label_patches[patch_idx]
                 moving_label_patch = moving_label_patches[patch_idx]
-                output["segmentation_fixed"] = fixed_label_patch.squeeze(0)
-                output["segmentation_moving"] = moving_label_patch.squeeze(0)
+                output["segmentation_fixed"] = fixed_label_patch  # Keep channel dimension
+                output["segmentation_moving"] = moving_label_patch  # Keep channel dimension
 
         return output
 
