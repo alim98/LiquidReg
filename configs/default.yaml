@@ -18,14 +18,19 @@ data:
   train_dir: "L2R_2021_Task3_train"
   val_dir: "L2R_2021_Task3_val"
   test_dir: null
-  batch_size: 2
+  batch_size: 1
   num_workers: 4
   pin_memory: true
   
+  # # Patch settings
+  # patch_size: 64
+  # patch_stride: 32
+  # patches_per_pair: 20
+  
   # Patch settings
-  patch_size: 64
-  patch_stride: 32
-  patches_per_pair: 20
+  patch_size: 32
+  patch_stride: 16
+  patches_per_pair: 10
   
   # Preprocessing
   normalize_method: "zscore"  # "zscore", "minmax", "percentile"
@@ -34,7 +39,7 @@ data:
 
 # Training Configuration
 training:
-  num_epochs: 200
+  num_epochs: 1
   learning_rate: 3.0e-4
   weight_decay: 1.0e-6
   optimizer: "adamw"  # "adam", "adamw", "sgd"
