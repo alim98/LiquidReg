@@ -72,14 +72,14 @@ LiquidReg/
 |-------|------------|--------|------|------|
 | VoxelMorph | 4.0M | 8.2GB | 45ms | 0.82 |
 | TransMorph | 64.0M | 12.5GB | 120ms | 0.85 |
-| **LiquidReg** | **0.05M** | **4.8GB** | **90ms** | **0.84** |
+| **LiquidReg** | **0.05M** | **4.8GB** | **--ms** | **--** |
 
 ## Citation
 
 ```bibtex
 @article{liquidreg2024,
   title={LiquidReg: Liquid Neural Networks for Deformable Medical Image Registration},
-  author={Your Name},
-  year={2024}
+  author={Ali Mikaeili Barzili},
+  year={2025}
 }
 ``` 
