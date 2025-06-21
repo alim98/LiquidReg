@@ -35,11 +35,27 @@ class LiquidReg(nn.Module):
         velocity_scale: float = 10.0,
         num_squaring: int = 6,
         fusion_type: str = "concat_pool",
+        use_gradient_checkpointing: bool = False,
     ):
+        """
+        Initialize LiquidReg model.
+        
+        Args:
+            image_size: Size of input images (D, H, W)
+            encoder_type: Type of encoder ("cnn" or "swin")
+            encoder_channels: Number of output channels from encoder
+            liquid_hidden_dim: Hidden dimension of liquid ODE
+            liquid_num_steps: Number of integration steps
+            velocity_scale: Scaling factor for velocity field
+            num_squaring: Number of squaring operations for diffeomorphism
+            fusion_type: Feature fusion type ("concat_pool", "attention", "gated")
+            use_gradient_checkpointing: Whether to use gradient checkpointing to save memory
+        """
         super().__init__()
         
         self.image_size = image_size
         self.encoder_type = encoder_type
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         
         # Shared encoder
         if encoder_type == "cnn":
@@ -106,6 +122,18 @@ class LiquidReg(nn.Module):
         
         return coord_grid
     
+    def _encode_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Helper function for gradient checkpointing of the encoder."""
+        return self.encoder(x)
+    
+    def _generate_velocity(self, coord_grid: torch.Tensor, liquid_params: torch.Tensor) -> torch.Tensor:
+        """Helper function for gradient checkpointing of the liquid core."""
+        return self.liquid_core(coord_grid, liquid_params)
+    
+    def _compute_deformation(self, velocity_field: torch.Tensor) -> torch.Tensor:
+        """Helper function for gradient checkpointing of scaling & squaring."""
+        return self.scaling_squaring(velocity_field)
+    
     def forward(
         self,
         fixed: torch.Tensor,
@@ -129,9 +157,13 @@ class LiquidReg(nn.Module):
         """
         B = fixed.shape[0]
         
-        # Encode images
-        feat_fixed = self.encoder(fixed)
-        feat_moving = self.encoder(moving)
+        # Encode images with optional gradient checkpointing
+        if self.use_gradient_checkpointing and self.training:
+            feat_fixed = torch.utils.checkpoint.checkpoint(self._encode_features, fixed)
+            feat_moving = torch.utils.checkpoint.checkpoint(self._encode_features, moving)
+        else:
+            feat_fixed = self.encoder(fixed)
+            feat_moving = self.encoder(moving)
         
         # Fuse features
         fused_features = self.fusion(feat_fixed, feat_moving)
@@ -142,11 +174,17 @@ class LiquidReg(nn.Module):
         # Expand coordinate grid to batch size
         coord_grid = self.coord_grid.unsqueeze(0).expand(B, -1, -1, -1, -1)
         
-        # Generate velocity field using liquid ODE
-        velocity_field = self.liquid_core(coord_grid, liquid_params)
+        # Generate velocity field using liquid ODE with optional gradient checkpointing
+        if self.use_gradient_checkpointing and self.training:
+            velocity_field = torch.utils.checkpoint.checkpoint(self._generate_velocity, coord_grid, liquid_params)
+        else:
+            velocity_field = self.liquid_core(coord_grid, liquid_params)
         
-        # Compute deformation field via scaling & squaring
-        deformation_field = self.scaling_squaring(velocity_field)
+        # Compute deformation field via scaling & squaring with optional gradient checkpointing
+        if self.use_gradient_checkpointing and self.training:
+            deformation_field = torch.utils.checkpoint.checkpoint(self._compute_deformation, velocity_field)
+        else:
+            deformation_field = self.scaling_squaring(velocity_field)
         
         # Warp moving image
         warped_moving = self.spatial_transformer(moving, deformation_field)
@@ -219,10 +257,12 @@ class LiquidRegLite(nn.Module):
         liquid_num_steps: int = 4,
         velocity_scale: float = 5.0,
         num_squaring: int = 4,
+        use_gradient_checkpointing: bool = False,
     ):
         super().__init__()
         
         self.image_size = image_size
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         
         # Lightweight encoder
         self.encoder = SimpleCNN3DEncoder(
@@ -276,32 +316,67 @@ class LiquidRegLite(nn.Module):
         
         return coord_grid
     
+    def _encode_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Helper function for gradient checkpointing of the encoder."""
+        return self.encoder(x)
+    
+    def _generate_velocity(self, coord_grid: torch.Tensor, liquid_params: torch.Tensor) -> torch.Tensor:
+        """Helper function for gradient checkpointing of the liquid core."""
+        return self.liquid_core(coord_grid, liquid_params)
+    
+    def _compute_deformation(self, velocity_field: torch.Tensor) -> torch.Tensor:
+        """Helper function for gradient checkpointing of scaling & squaring."""
+        return self.scaling_squaring(velocity_field)
+    
     def forward(
         self,
         fixed: torch.Tensor,
-        moving: torch.Tensor
+        moving: torch.Tensor,
+        return_intermediate: bool = False
     ) -> Dict[str, torch.Tensor]:
         """Forward pass."""
         B = fixed.shape[0]
         
-        # Encode and fuse
-        feat_fixed = self.encoder(fixed)
-        feat_moving = self.encoder(moving)
+        # Encode with optional gradient checkpointing
+        if self.use_gradient_checkpointing and self.training:
+            feat_fixed = torch.utils.checkpoint.checkpoint(self._encode_features, fixed)
+            feat_moving = torch.utils.checkpoint.checkpoint(self._encode_features, moving)
+        else:
+            feat_fixed = self.encoder(fixed)
+            feat_moving = self.encoder(moving)
+        
+        # Fuse features
         fused_features = self.fusion(feat_fixed, feat_moving)
         
         # Generate liquid parameters
         liquid_params = self.hyper_net(fused_features)
         
-        # Generate velocity and deformation fields
+        # Generate velocity and deformation fields with optional gradient checkpointing
         coord_grid = self.coord_grid.unsqueeze(0).expand(B, -1, -1, -1, -1)
-        velocity_field = self.liquid_core(coord_grid, liquid_params)
-        deformation_field = self.scaling_squaring(velocity_field)
+        
+        if self.use_gradient_checkpointing and self.training:
+            velocity_field = torch.utils.checkpoint.checkpoint(self._generate_velocity, coord_grid, liquid_params)
+            deformation_field = torch.utils.checkpoint.checkpoint(self._compute_deformation, velocity_field)
+        else:
+            velocity_field = self.liquid_core(coord_grid, liquid_params)
+            deformation_field = self.scaling_squaring(velocity_field)
         
         # Warp image
         warped_moving = self.spatial_transformer(moving, deformation_field)
         
-        return {
+        output = {
             "warped_moving": warped_moving,
             "deformation_field": deformation_field,
             "velocity_field": velocity_field,
-        } 
+        }
+        
+        if return_intermediate:
+            output["features_fixed"] = feat_fixed
+            output["features_moving"] = feat_moving
+            output["liquid_params"] = liquid_params
+            
+            from .scaling_squaring import compute_jacobian_determinant
+            jacobian_det = compute_jacobian_determinant(deformation_field)
+            output["jacobian_det"] = jacobian_det
+            
+        return output 

@@ -48,6 +48,9 @@ def create_model(config: dict) -> nn.Module:
     """Create model based on configuration."""
     model_config = config['model']
     
+    # Get gradient checkpointing setting from training config (default to False if not present)
+    use_gradient_checkpointing = config['training'].get('use_gradient_checkpointing', False)
+    
     if model_config['name'] == 'LiquidReg':
         model = LiquidReg(
             image_size=tuple(model_config['image_size']),
@@ -58,6 +61,7 @@ def create_model(config: dict) -> nn.Module:
             velocity_scale=model_config['velocity_scale'],
             num_squaring=model_config['num_squaring'],
             fusion_type=model_config['fusion_type'],
+            use_gradient_checkpointing=use_gradient_checkpointing,
         )
     elif model_config['name'] == 'LiquidRegLite':
         model = LiquidRegLite(
@@ -67,6 +71,7 @@ def create_model(config: dict) -> nn.Module:
             liquid_num_steps=model_config['liquid_num_steps'],
             velocity_scale=model_config['velocity_scale'],
             num_squaring=model_config['num_squaring'],
+            use_gradient_checkpointing=use_gradient_checkpointing,
         )
     else:
         raise ValueError(f"Unknown model: {model_config['name']}")
@@ -347,6 +352,10 @@ def main():
                        help='Path to configuration file')
     parser.add_argument('--data_root', type=str, default=None,
                        help='Override data root directory')
+    parser.add_argument('--subset_percent', type=float, default=100.0,
+                       help='Percentage of dataset to use (1.0 = 1%, 10.0 = 10%, 100.0 = full dataset)')
+    parser.add_argument('--memory_efficient', action='store_true',
+                       help='Enable memory-efficient mode with reduced batch size and model size')
     
     args = parser.parse_args()
     
@@ -356,6 +365,36 @@ def main():
     # Override data root if provided
     if args.data_root:
         config['data']['data_root'] = args.data_root
+    
+    # Apply memory efficiency settings if requested
+    if args.memory_efficient:
+        # Reduce batch size
+        original_batch_size = config['data']['batch_size']
+        config['data']['batch_size'] = max(1, config['data']['batch_size'] // 2)
+        
+        # Use smaller patch size
+        original_patch_size = config['data']['patch_size']
+        config['data']['patch_size'] = min(48, config['data']['patch_size'])
+        
+        # Use fewer patches per pair
+        original_patches_per_pair = config['data']['patches_per_pair']
+        config['data']['patches_per_pair'] = max(5, config['data']['patches_per_pair'] // 2)
+        
+        # Use smaller model if LiquidReg
+        if config['model']['name'] == 'LiquidReg':
+            config['model']['encoder_channels'] = min(128, config['model']['encoder_channels'])
+            config['model']['liquid_hidden_dim'] = min(32, config['model']['liquid_hidden_dim'])
+        
+        # Enable gradient checkpointing to save memory
+        config['training']['use_gradient_checkpointing'] = True
+        
+        print(f"Memory-efficient mode enabled:")
+        print(f"  - Batch size: {original_batch_size} → {config['data']['batch_size']}")
+        print(f"  - Patch size: {original_patch_size} → {config['data']['patch_size']}")
+        print(f"  - Patches per pair: {original_patches_per_pair} → {config['data']['patches_per_pair']}")
+        print(f"  - Encoder channels: {config['model']['encoder_channels']}")
+        print(f"  - Liquid hidden dim: {config['model']['liquid_hidden_dim']}")
+        print(f"  - Gradient checkpointing: Enabled")
     
     # Set random seed
     set_seed(config['seed'])
@@ -383,6 +422,47 @@ def main():
         patches_per_pair=config['data']['patches_per_pair'],
         num_workers=config['data']['num_workers']
     )
+    
+    # Apply subset percentage if specified
+    if args.subset_percent < 100.0:
+        subset_fraction = args.subset_percent / 100.0
+        train_size = int(len(train_loader.dataset) * subset_fraction)
+        val_size = int(len(val_loader.dataset) * subset_fraction)
+        
+        # Create subset samplers
+        from torch.utils.data import SubsetRandomSampler
+        import numpy as np
+        
+        # For training data
+        train_indices = list(range(len(train_loader.dataset)))
+        np.random.shuffle(train_indices)
+        train_indices = train_indices[:train_size]
+        train_sampler = SubsetRandomSampler(train_indices)
+        
+        # For validation data
+        val_indices = list(range(len(val_loader.dataset)))
+        np.random.shuffle(val_indices)
+        val_indices = val_indices[:val_size]
+        val_sampler = SubsetRandomSampler(val_indices)
+        
+        # Recreate data loaders with samplers
+        train_loader = torch.utils.data.DataLoader(
+            train_loader.dataset,
+            batch_size=config['data']['batch_size'],
+            sampler=train_sampler,
+            num_workers=config['data']['num_workers'],
+            pin_memory=True
+        )
+        
+        val_loader = torch.utils.data.DataLoader(
+            val_loader.dataset,
+            batch_size=config['data']['batch_size'],
+            sampler=val_sampler,
+            num_workers=config['data']['num_workers'],
+            pin_memory=True
+        )
+        
+        print(f"Using {args.subset_percent}% of dataset: {train_size} training samples, {val_size} validation samples")
     
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
