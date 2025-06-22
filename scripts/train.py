@@ -153,36 +153,36 @@ def train_epoch(
     
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
 
-                from torch.cuda.amp import autocast as cuda_autocast
-                autocast_context = cuda_autocast(enabled=use_amp)
-            
-            with autocast_context:
-                output = model(fixed, moving, return_intermediate=True)
-                
-                warped = output['warped_moving']
-                velocity = output['velocity_field']
-                jacobian_det = output['jacobian_det']
-                liquid_params = output['liquid_params']
-                
-                # Compute losses
-                losses = criterion(
-                    fixed=fixed,
-                    warped=warped,
-                    velocity_field=velocity,
-                    jacobian_det=jacobian_det,
-                    liquid_params=liquid_params
-                )
-                
-                loss = losses['total']
-            
-            # Accumulate losses
-            total_loss += loss.item()
-            for key, value in losses.items():
-                if key not in total_losses:
-                    total_losses[key] = 0.0
-                total_losses[key] += value.item()
-            
-            pbar.set_postfix({'val_loss': f"{loss.item():.4f}"})
+    from torch.cuda.amp import autocast as cuda_autocast
+    autocast_context = cuda_autocast(enabled=use_amp)
+    
+    with autocast_context:
+        output = model(fixed, moving, return_intermediate=True)
+        
+        warped = output['warped_moving']
+        velocity = output['velocity_field']
+        jacobian_det = output['jacobian_det']
+        liquid_params = output['liquid_params']
+        
+        # Compute losses
+        losses = criterion(
+            fixed=fixed,
+            warped=warped,
+            velocity_field=velocity,
+            jacobian_det=jacobian_det,
+            liquid_params=liquid_params
+        )
+        
+        loss = losses['total']
+    
+    # Accumulate losses
+    total_loss += loss.item()
+    for key, value in losses.items():
+        if key not in total_losses:
+            total_losses[key] = 0.0
+        total_losses[key] += value.item()
+    
+    pbar.set_postfix({'val_loss': f"{loss.item():.4f}"})
     
     # Average losses
     avg_losses = {key: value / num_batches for key, value in total_losses.items()}
