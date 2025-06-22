@@ -152,12 +152,10 @@ def train_epoch(
     num_batches = len(train_loader)
     
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
-    
+
     for batch_idx, batch in enumerate(pbar):
         fixed = batch['fixed'].float()
         moving = batch['moving'].float()
-        
-
         
         # Move to device
         device = next(model.parameters()).device
@@ -172,7 +170,7 @@ def train_epoch(
             # Try new API first
             from torch.amp import autocast
             autocast_context = autocast(device_type=device.type, enabled=use_amp)
-        except TypeError:
+        except (ImportError, TypeError):
             # Fallback to old API
             from torch.cuda.amp import autocast as cuda_autocast
             autocast_context = cuda_autocast(enabled=use_amp)
@@ -195,17 +193,13 @@ def train_epoch(
                     liquid_params=liquid_params
                 )
                 
-
-                
                 loss = losses['total']
         except Exception as e:
             print(f"[ERROR] Exception in forward pass: {e}")
-            import traceback
-            traceback.print_exc()
             continue
         
         # Backward pass
-        if use_amp and scaler is not None:
+        if use_amp and scaler is not None and hasattr(scaler, 'scale'):
             try:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -230,8 +224,6 @@ def train_epoch(
                 scaler.update()
             except Exception as e:
                 print(f"[ERROR] Exception in backward pass: {e}")
-                import traceback
-                traceback.print_exc()
                 continue
         else:
             try:
@@ -255,8 +247,6 @@ def train_epoch(
                 optimizer.step()
             except Exception as e:
                 print(f"[ERROR] Exception in backward pass: {e}")
-                import traceback
-                traceback.print_exc()
                 continue
         
         # Accumulate losses
@@ -321,7 +311,7 @@ def validate_epoch(
                 # Try new API first
                 from torch.amp import autocast
                 autocast_context = autocast(device_type=device.type, enabled=use_amp)
-            except TypeError:
+            except (ImportError, TypeError):
                 # Fallback to old API
                 from torch.cuda.amp import autocast as cuda_autocast
                 autocast_context = cuda_autocast(enabled=use_amp)
@@ -571,11 +561,17 @@ def main():
         jacobian_penalty=config['training']['jacobian_penalty']
     )
     
-    # Mixed precision scaler
-    # Fix deprecated GradScaler API
+    # Mixed precision scaler  
+    # Use the new GradScaler API
     if config['training']['use_amp'] and device.type == 'cuda':
-        from torch.cuda.amp import GradScaler
-        scaler = GradScaler()
+        try:
+            # Try new API first (PyTorch >= 2.1)
+            from torch.amp import GradScaler
+            scaler = GradScaler('cuda')
+        except (ImportError, TypeError):
+            # Fallback to old API
+            from torch.cuda.amp import GradScaler
+            scaler = GradScaler()
     else:
         # For CPU or when AMP is disabled, create a dummy scaler
         class DummyScaler:

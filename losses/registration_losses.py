@@ -43,9 +43,12 @@ class LocalNormalizedCrossCorrelation(nn.Module):
         fixed = F.pad(fixed, [pad] * 6, mode='reflect')
         warped = F.pad(warped, [pad] * 6, mode='reflect')
         
+        # Ensure kernel matches input dtype for mixed precision compatibility
+        kernel = self.kernel.to(dtype=fixed.dtype)
+        
         # Compute local means
-        mu_fixed = F.conv3d(fixed, self.kernel, padding=0)
-        mu_warped = F.conv3d(warped, self.kernel, padding=0)
+        mu_fixed = F.conv3d(fixed, kernel, padding=0)
+        mu_warped = F.conv3d(warped, kernel, padding=0)
         
 
         
@@ -54,9 +57,9 @@ class LocalNormalizedCrossCorrelation(nn.Module):
         mu_warped_sq = mu_warped ** 2
         mu_fixed_warped = mu_fixed * mu_warped
         
-        sigma_fixed_sq = F.conv3d(fixed ** 2, self.kernel, padding=0) - mu_fixed_sq
-        sigma_warped_sq = F.conv3d(warped ** 2, self.kernel, padding=0) - mu_warped_sq
-        sigma_fixed_warped = F.conv3d(fixed * warped, self.kernel, padding=0) - mu_fixed_warped
+        sigma_fixed_sq = F.conv3d(fixed ** 2, kernel, padding=0) - mu_fixed_sq
+        sigma_warped_sq = F.conv3d(warped ** 2, kernel, padding=0) - mu_warped_sq
+        sigma_fixed_warped = F.conv3d(fixed * warped, kernel, padding=0) - mu_fixed_warped
         
         # Check for negative variances and fix them
         sigma_fixed_sq = torch.clamp(sigma_fixed_sq, min=self.eps)
