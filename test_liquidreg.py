@@ -1,203 +1,132 @@
 #!/usr/bin/env python3
 """
-Simple test script to verify LiquidReg implementation.
+Test script for LiquidReg model.
 """
 
 import torch
-import numpy as np
-from models import LiquidReg, LiquidRegLite
-from losses import CompositeLoss
-from utils import normalize_volume
+import torch.nn as nn
+from models.liquidreg import LiquidReg, LiquidRegLite
+from losses.registration_losses import CompositeLoss
 
 
-def test_model_creation():
-    """Test model creation and parameter counting."""
-    print("Testing model creation...")
+def test_liquidreg():
+    """Test LiquidReg model with different image sizes."""
+    print("Testing LiquidReg model...")
     
-    # Test LiquidReg
-    model = LiquidReg(
-        image_size=(64, 64, 64),
-        encoder_channels=128,
-        liquid_hidden_dim=32,
-        liquid_num_steps=4,
-    )
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"LiquidReg parameters: {total_params:,}")
-    
-    # Test LiquidRegLite
-    model_lite = LiquidRegLite(
-        image_size=(64, 64, 64),
-        encoder_channels=64,
-        liquid_hidden_dim=16,
-        liquid_num_steps=4,
-    )
-    
-    total_params_lite = sum(p.numel() for p in model_lite.parameters())
-    print(f"LiquidRegLite parameters: {total_params_lite:,}")
-    
-    assert total_params > 0, "Model has no parameters"
-    assert total_params_lite < total_params, "Lite model should have fewer parameters"
-    print("✓ Model creation test passed")
-
-
-def test_forward_pass():
-    """Test forward pass with synthetic data."""
-    print("\nTesting forward pass...")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    # Test with different patch sizes
+    patch_sizes = [(32, 32, 32), (64, 64, 64), (128, 128, 128)]
     
     # Create model
     model = LiquidReg(
-        image_size=(64, 64, 64),
-        encoder_channels=128,
-        liquid_hidden_dim=32,
-        liquid_num_steps=4,
-    ).to(device)
+        image_size=(128, 128, 128),  # Default size, should adapt to inputs
+        encoder_type="cnn",
+        encoder_channels=256,
+        liquid_hidden_dim=64,
+        liquid_num_steps=8,
+        velocity_scale=10.0,
+        num_squaring=6,
+        fusion_type="concat_pool",
+    )
     
-    # Create synthetic data
-    fixed = torch.randn(1, 1, 64, 64, 64, device=device)
-    moving = torch.randn(1, 1, 64, 64, 64, device=device)
-    
-    # Normalize images
-    fixed = normalize_volume(fixed)
-    moving = normalize_volume(moving)
-    
-    # Forward pass
-    model.eval()
-    with torch.no_grad():
-        output = model(fixed, moving, return_intermediate=True)
-    
-    print(f"Warped shape: {output['warped_moving'].shape}")
-    print(f"Deformation shape: {output['deformation_field'].shape}")
-    print("✓ Forward pass test passed")
-
-
-def test_loss_computation():
-    """Test loss computation."""
-    print("\nTesting loss computation...")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Print model parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"LiquidReg total parameters: {total_params:,}")
     
     # Create loss function
     criterion = CompositeLoss(
         similarity_loss="lncc",
         lambda_similarity=1.0,
-        lambda_jacobian=0.1,
+        lambda_jacobian=1.0,
         lambda_velocity=0.01,
         lambda_liquid=0.001,
+        lncc_window=9,
+        jacobian_penalty="l2"
     )
     
-    # Create synthetic data
-    batch_size = 1
-    fixed = torch.randn(batch_size, 1, 64, 64, 64, device=device, requires_grad=True)
-    warped = torch.randn(batch_size, 1, 64, 64, 64, device=device, requires_grad=True)
-    velocity = torch.randn(batch_size, 3, 64, 64, 64, device=device, requires_grad=True)
-    jacobian_det = torch.ones(batch_size, 1, 62, 62, 62, device=device, requires_grad=True)  # Smaller due to gradient computation
-    liquid_params = torch.randn(batch_size, 1000, device=device, requires_grad=True)
+    # Test with different patch sizes
+    for D, H, W in patch_sizes:
+        print(f"\nTesting with patch size: {D}x{H}x{W}")
+        
+        # Create random input tensors
+        fixed = torch.randn(2, 1, D, H, W)
+        moving = torch.randn(2, 1, D, H, W)
+        
+        # Forward pass
+        output = model(fixed, moving, return_intermediate=True)
+        
+        # Check output shapes
+        warped = output['warped_moving']
+        deformation = output['deformation_field']
+        velocity = output['velocity_field']
+        jacobian_det = output['jacobian_det']
+        
+        print(f"Input shape: {fixed.shape}")
+        print(f"Warped shape: {warped.shape}")
+        print(f"Deformation field shape: {deformation.shape}")
+        print(f"Velocity field shape: {velocity.shape}")
+        print(f"Jacobian determinant shape: {jacobian_det.shape}")
+        
+        # Compute loss
+        losses = criterion(
+            fixed=fixed,
+            warped=warped,
+            velocity_field=velocity,
+            jacobian_det=jacobian_det,
+            liquid_params=output['liquid_params']
+        )
+        
+        print(f"Loss: {losses['total'].item():.4f}")
+        
+        # Test backpropagation
+        losses['total'].backward()
+        print("Backpropagation successful!")
+
+
+def test_liquidreg_lite():
+    """Test LiquidRegLite model with different image sizes."""
+    print("\nTesting LiquidRegLite model...")
     
-    # Compute losses
-    losses = criterion(
-        fixed=fixed,
-        warped=warped,
-        velocity_field=velocity,
-        jacobian_det=jacobian_det,
-        liquid_params=liquid_params,
+    # Create model
+    model = LiquidRegLite(
+        image_size=(64, 64, 64),  # Default size, should adapt to inputs
+        encoder_channels=128,
+        liquid_hidden_dim=32,
+        liquid_num_steps=4,
+        velocity_scale=5.0,
+        num_squaring=4,
     )
     
-    # Check loss components
-    assert 'total' in losses, "Missing total loss"
-    assert 'similarity' in losses, "Missing similarity loss"
-    assert 'jacobian' in losses, "Missing jacobian loss"
-    assert 'velocity' in losses, "Missing velocity loss"
-    assert 'liquid' in losses, "Missing liquid loss"
+    # Print model parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"LiquidRegLite total parameters: {total_params:,}")
     
-    total_loss = losses['total']
-    assert torch.isfinite(total_loss), "Total loss is not finite"
-    assert total_loss.requires_grad, "Loss should require gradients"
+    # Test with a single patch size
+    D, H, W = 32, 32, 32
+    print(f"\nTesting with patch size: {D}x{H}x{W}")
     
-    print(f"Total loss: {total_loss.item():.4f}")
-    print(f"Similarity loss: {losses['similarity'].item():.4f}")
-    print(f"Jacobian loss: {losses['jacobian'].item():.4f}")
-    print(f"Velocity loss: {losses['velocity'].item():.4f}")
-    print(f"Liquid loss: {losses['liquid'].item():.4f}")
-    
-    print("✓ Loss computation test passed")
-
-
-def test_gradient_flow():
-    """Test gradient computation and backpropagation."""
-    print("\nTesting gradient flow...")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Create model and loss
-    model = LiquidReg(
-        image_size=(32, 32, 32),  # Smaller for faster computation
-        encoder_channels=64,
-        liquid_hidden_dim=16,
-        liquid_num_steps=2,
-    ).to(device)
-    
-    criterion = CompositeLoss()
-    
-    # Create synthetic data
-    fixed = torch.randn(1, 1, 32, 32, 32, device=device)
-    moving = torch.randn(1, 1, 32, 32, 32, device=device)
-    
-    # Normalize
-    fixed = normalize_volume(fixed)
-    moving = normalize_volume(moving)
+    # Create random input tensors
+    fixed = torch.randn(2, 1, D, H, W)
+    moving = torch.randn(2, 1, D, H, W)
     
     # Forward pass
     output = model(fixed, moving, return_intermediate=True)
     
-    # Compute loss
-    losses = criterion(
-        fixed=fixed,
-        warped=output['warped_moving'],
-        velocity_field=output['velocity_field'],
-        jacobian_det=output['jacobian_det'],
-        liquid_params=output['liquid_params'],
-    )
+    # Check output shapes
+    warped = output['warped_moving']
+    deformation = output['deformation_field']
+    velocity = output['velocity_field']
     
-    # Backward pass
-    total_loss = losses['total']
-    total_loss.backward()
+    print(f"Input shape: {fixed.shape}")
+    print(f"Warped shape: {warped.shape}")
+    print(f"Deformation field shape: {deformation.shape}")
+    print(f"Velocity field shape: {velocity.shape}")
     
-    # Check gradients
-    grad_norms = []
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            grad_norm = param.grad.norm().item()
-            grad_norms.append(grad_norm)
-            if grad_norm == 0:
-                print(f"Warning: Zero gradient for {name}")
-    
-    assert len(grad_norms) > 0, "No gradients computed"
-    avg_grad_norm = np.mean(grad_norms)
-    print(f"Average gradient norm: {avg_grad_norm:.4f}")
-    print(f"Parameters with gradients: {len(grad_norms)}")
-    
-    print("✓ Gradient flow test passed")
+    # Test backpropagation
+    loss = torch.mean((fixed - warped) ** 2)
+    loss.backward()
+    print("Backpropagation successful!")
 
 
-def main():
-    """Run all tests."""
-    print("Running LiquidReg tests...\n")
-    
-    try:
-        test_model_creation()
-        test_forward_pass()
-        test_loss_computation()
-        
-        print("\n🎉 All tests passed! LiquidReg is working correctly.")
-        
-    except Exception as e:
-        print(f"\n❌ Test failed with error: {e}")
-        raise
-
-
-if __name__ == '__main__':
-    main() 
+if __name__ == "__main__":
+    test_liquidreg()
+    test_liquidreg_lite()

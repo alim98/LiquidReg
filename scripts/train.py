@@ -168,8 +168,9 @@ def train_epoch(
         use_amp = config['training']['use_amp']
         try:
             # Try new API first
-            autocast_context = autocast('cuda', enabled=use_amp)
-        except:
+            from torch.amp import autocast
+            autocast_context = autocast(device_type=device.type, enabled=use_amp)
+        except TypeError:
             # Fallback to old API
             from torch.cuda.amp import autocast as cuda_autocast
             autocast_context = cuda_autocast(enabled=use_amp)
@@ -522,8 +523,8 @@ def main():
     if config['training']['use_amp']:
         try:
             # Try new API first
-            scaler = GradScaler('cuda', enabled=config['training']['use_amp'])
-        except:
+            scaler = GradScaler(enabled=config['training']['use_amp'])
+        except TypeError:
             # Fallback to old API
             from torch.cuda.amp import GradScaler as CudaGradScaler
             scaler = CudaGradScaler(enabled=config['training']['use_amp'])
