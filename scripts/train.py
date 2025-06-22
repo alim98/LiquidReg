@@ -152,37 +152,203 @@ def train_epoch(
     num_batches = len(train_loader)
     
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+    
+    for batch_idx, batch in enumerate(pbar):
+        fixed = batch['fixed'].float()
+        moving = batch['moving'].float()
+        
+        # Move to device
+        device = next(model.parameters()).device
+        fixed = fixed.to(device)
+        moving = moving.to(device)
+        
+        optimizer.zero_grad()
+        
+        # Forward pass with mixed precision
+        use_amp = config['training']['use_amp']
+        try:
+            # Try new API first
+            from torch.amp import autocast
+            autocast_context = autocast(device_type=device.type, enabled=use_amp)
+        except TypeError:
+            # Fallback to old API
+            from torch.cuda.amp import autocast as cuda_autocast
+            autocast_context = cuda_autocast(enabled=use_amp)
+        
+        try:
+            with autocast_context:
+                output = model(fixed, moving, return_intermediate=True)
+                
+                warped = output['warped_moving']
+                velocity = output['velocity_field']
+                jacobian_det = output['jacobian_det']
+                liquid_params = output['liquid_params']
+                
+                # Compute losses
+                losses = criterion(
+                    fixed=fixed,
+                    warped=warped,
+                    velocity_field=velocity,
+                    jacobian_det=jacobian_det,
+                    liquid_params=liquid_params
+                )
+                
+                loss = losses['total']
+        except Exception as e:
+            print(f"[ERROR] Exception in forward pass: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+        
+        # Backward pass
+        if use_amp and scaler is not None:
+            try:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                
+                # Gradient clipping
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), 
+                    config['training']['grad_clip_norm']
+                )
+                
+                # Check for NaN gradients
+                has_nan_grad = False
+                for name, param in model.named_parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        has_nan_grad = True
+                        break
+                
+                if has_nan_grad:
+                    continue
+                
+                scaler.step(optimizer)
+                scaler.update()
+            except Exception as e:
+                print(f"[ERROR] Exception in backward pass: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        else:
+            try:
+                loss.backward()
+                
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), 
+                    config['training']['grad_clip_norm']
+                )
+                
+                # Check for NaN gradients
+                has_nan_grad = False
+                for name, param in model.named_parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        has_nan_grad = True
+                        break
+                
+                if has_nan_grad:
+                    continue
+                
+                optimizer.step()
+            except Exception as e:
+                print(f"[ERROR] Exception in backward pass: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        # Accumulate losses
+        total_loss += loss.item()
+        for key, value in losses.items():
+            if key not in total_losses:
+                total_losses[key] = 0.0
+            total_losses[key] += value.item()
+        
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': f"{loss.item():.4f}",
+            'grad': f"{grad_norm:.2f}"
+        })
+        
+        # Log to tensorboard
+        if batch_idx % config['logging']['log_interval'] == 0:
+            step = epoch * num_batches + batch_idx
+            writer.add_scalar('train/loss', loss.item(), step)
+            writer.add_scalar('train/grad_norm', grad_norm, step)
+            
+            for key, value in losses.items():
+                writer.add_scalar(f'train/{key}', value.item(), step)
+    
+    # Average losses
+    avg_losses = {key: value / num_batches for key, value in total_losses.items()}
+    avg_losses['avg_loss'] = total_loss / num_batches
+    
+    return avg_losses
 
-    from torch.cuda.amp import autocast as cuda_autocast
-    autocast_context = cuda_autocast(enabled=use_amp)
+
+def validate_epoch(
+    model: nn.Module,
+    val_loader,
+    criterion,
+    config: dict,
+    epoch: int,
+    writer: SummaryWriter
+) -> dict:
+    """Validate for one epoch."""
+    model.eval()
     
-    with autocast_context:
-        output = model(fixed, moving, return_intermediate=True)
-        
-        warped = output['warped_moving']
-        velocity = output['velocity_field']
-        jacobian_det = output['jacobian_det']
-        liquid_params = output['liquid_params']
-        
-        # Compute losses
-        losses = criterion(
-            fixed=fixed,
-            warped=warped,
-            velocity_field=velocity,
-            jacobian_det=jacobian_det,
-            liquid_params=liquid_params
-        )
-        
-        loss = losses['total']
+    total_loss = 0.0
+    total_losses = {}
+    num_batches = len(val_loader)
     
-    # Accumulate losses
-    total_loss += loss.item()
-    for key, value in losses.items():
-        if key not in total_losses:
-            total_losses[key] = 0.0
-        total_losses[key] += value.item()
-    
-    pbar.set_postfix({'val_loss': f"{loss.item():.4f}"})
+    with torch.no_grad():
+        pbar = tqdm(val_loader, desc=f"Validation {epoch}")
+        
+        for batch_idx, batch in enumerate(pbar):
+            fixed = batch['fixed'].float()
+            moving = batch['moving'].float()
+            
+            # Move to device
+            device = next(model.parameters()).device
+            fixed = fixed.to(device)
+            moving = moving.to(device)
+            
+            # Forward pass with mixed precision
+            use_amp = config['training']['use_amp']
+            try:
+                # Try new API first
+                from torch.amp import autocast
+                autocast_context = autocast(device_type=device.type, enabled=use_amp)
+            except TypeError:
+                # Fallback to old API
+                from torch.cuda.amp import autocast as cuda_autocast
+                autocast_context = cuda_autocast(enabled=use_amp)
+            
+            with autocast_context:
+                output = model(fixed, moving, return_intermediate=True)
+                
+                warped = output['warped_moving']
+                velocity = output['velocity_field']
+                jacobian_det = output['jacobian_det']
+                liquid_params = output['liquid_params']
+                
+                # Compute losses
+                losses = criterion(
+                    fixed=fixed,
+                    warped=warped,
+                    velocity_field=velocity,
+                    jacobian_det=jacobian_det,
+                    liquid_params=liquid_params
+                )
+                
+                loss = losses['total']
+            
+            # Accumulate losses
+            total_loss += loss.item()
+            for key, value in losses.items():
+                if key not in total_losses:
+                    total_losses[key] = 0.0
+                total_losses[key] += value.item()
+            
+            pbar.set_postfix({'val_loss': f"{loss.item():.4f}"})
     
     # Average losses
     avg_losses = {key: value / num_batches for key, value in total_losses.items()}
