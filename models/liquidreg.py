@@ -15,14 +15,13 @@ from .scaling_squaring import ScalingSquaring, SpatialTransformer
 
 class LiquidReg(nn.Module):
     """
-    LiquidReg: Adaptive ODE engine for deformable registration.
+    LiquidReg: Adaptive ODE Engine for Deformable Medical Image Registration.
     
-    The model consists of:
-    1. Shared encoder for fixed and moving images
-    2. Feature fusion and hyper-network for parameter generation
-    3. Liquid ODE core for velocity field generation
-    4. Scaling & squaring for diffeomorphic deformation
-    5. Spatial transformer for image warping
+    Combines:
+    1. Liquid Time-constant Networks (LTC) for dynamics
+    2. Diffeomorphic transformations via scaling & squaring
+    3. Hyper-networks for parameter generation
+    4. Continuous-time ODE solvers
     """
     
     def __init__(
@@ -86,12 +85,12 @@ class LiquidReg(nn.Module):
         # Spatial transformer
         self.spatial_transformer = SpatialTransformer()
         
-        # Generate coordinate grids
-        self.register_buffer("coord_grid", self._generate_coordinate_grid())
-    
-    def _generate_coordinate_grid(self) -> torch.Tensor:
+        # Generate coordinate grids - will be dynamically generated in forward pass
+        # based on actual input dimensions
+        
+    def _generate_coordinate_grid(self, size: Tuple[int, int, int]) -> torch.Tensor:
         """Generate normalized coordinate grid for the image."""
-        D, H, W = self.image_size
+        D, H, W = size
         
         # Create coordinate vectors
         d = torch.linspace(-1, 1, D)
@@ -129,6 +128,9 @@ class LiquidReg(nn.Module):
         """
         B = fixed.shape[0]
         
+        # Get actual image dimensions from input
+        _, _, D, H, W = fixed.shape
+        
         # Encode images
         feat_fixed = self.encoder(fixed)
         feat_moving = self.encoder(moving)
@@ -139,8 +141,9 @@ class LiquidReg(nn.Module):
         # Generate parameters via hyper-network
         liquid_params = self.hyper_net(fused_features)
         
-        # Expand coordinate grid to batch size
-        coord_grid = self.coord_grid.unsqueeze(0).expand(B, -1, -1, -1, -1)
+        # Generate coordinate grid based on actual input dimensions
+        coord_grid = self._generate_coordinate_grid((D, H, W)).to(fixed.device)
+        coord_grid = coord_grid.unsqueeze(0).expand(B, -1, -1, -1, -1)
         
         # Generate velocity field using liquid ODE
         velocity_field = self.liquid_core(coord_grid, liquid_params)
@@ -260,12 +263,11 @@ class LiquidRegLite(nn.Module):
         # Spatial transformer
         self.spatial_transformer = SpatialTransformer()
         
-        # Generate coordinate grids
-        self.register_buffer("coord_grid", self._generate_coordinate_grid())
+        # Coordinate grids will be generated dynamically in forward pass
     
-    def _generate_coordinate_grid(self) -> torch.Tensor:
+    def _generate_coordinate_grid(self, size: Tuple[int, int, int]) -> torch.Tensor:
         """Generate normalized coordinate grid."""
-        D, H, W = self.image_size
+        D, H, W = size
         
         d = torch.linspace(-1, 1, D)
         h = torch.linspace(-1, 1, H)
@@ -279,10 +281,14 @@ class LiquidRegLite(nn.Module):
     def forward(
         self,
         fixed: torch.Tensor,
-        moving: torch.Tensor
+        moving: torch.Tensor,
+        return_intermediate: bool = False
     ) -> Dict[str, torch.Tensor]:
         """Forward pass."""
         B = fixed.shape[0]
+        
+        # Get actual image dimensions from input
+        _, _, D, H, W = fixed.shape
         
         # Encode and fuse
         feat_fixed = self.encoder(fixed)
@@ -292,16 +298,30 @@ class LiquidRegLite(nn.Module):
         # Generate liquid parameters
         liquid_params = self.hyper_net(fused_features)
         
+        # Generate coordinate grid based on actual input dimensions
+        coord_grid = self._generate_coordinate_grid((D, H, W)).to(fixed.device)
+        coord_grid = coord_grid.unsqueeze(0).expand(B, -1, -1, -1, -1)
+        
         # Generate velocity and deformation fields
-        coord_grid = self.coord_grid.unsqueeze(0).expand(B, -1, -1, -1, -1)
         velocity_field = self.liquid_core(coord_grid, liquid_params)
         deformation_field = self.scaling_squaring(velocity_field)
         
         # Warp image
         warped_moving = self.spatial_transformer(moving, deformation_field)
         
-        return {
+        output = {
             "warped_moving": warped_moving,
             "deformation_field": deformation_field,
             "velocity_field": velocity_field,
-        } 
+        }
+        
+        if return_intermediate and B > 0:
+            from .scaling_squaring import compute_jacobian_determinant
+            jacobian_det = compute_jacobian_determinant(deformation_field)
+            output["jacobian_det"] = jacobian_det
+            output["features_fixed"] = feat_fixed
+            output["features_moving"] = feat_moving
+            output["fused_features"] = fused_features
+            output["liquid_params"] = liquid_params
+            
+        return output 
