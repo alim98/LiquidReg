@@ -108,8 +108,9 @@ class ScalingSquaring(nn.Module):
         # Check for values outside [-1, 1] which could cause issues in grid_sample
         if (sample_grid.abs() > 1.0).any():
             print(f"[WARNING] Sample grid values outside [-1, 1] range: {(sample_grid.abs() > 1.0).sum().item()} values")
-            # Clamp to valid range
-            sample_grid = torch.clamp(sample_grid, -1.0, 1.0)
+        
+        # Always clamp to valid range with small margin to prevent boundary issues
+        sample_grid = torch.clamp(sample_grid, -0.999, 0.999)
         
         # Sample flow1 at displaced positions
         flow1_displaced = F.grid_sample(

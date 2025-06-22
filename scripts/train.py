@@ -605,7 +605,18 @@ def main():
     if config['training']['use_amp']:
         try:
             # Try new API first
-            scaler = GradScaler(enabled=config['training']['use_amp'])
+            # Fix deprecated GradScaler API
+    if config['training']['use_amp'] and device.type == 'cuda':
+        from torch.cuda.amp import GradScaler
+        scaler = GradScaler()
+    else:
+        # For CPU or when AMP is disabled, create a dummy scaler
+        class DummyScaler:
+            def scale(self, loss): return loss
+            def step(self, optimizer): optimizer.step()
+            def update(self): pass
+            def unscale_(self, optimizer): pass
+        scaler = DummyScaler()
         except TypeError:
             # Fallback to old API
             from torch.cuda.amp import GradScaler as CudaGradScaler

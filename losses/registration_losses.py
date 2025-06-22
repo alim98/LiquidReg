@@ -78,10 +78,22 @@ class LocalNormalizedCrossCorrelation(nn.Module):
             sigma_fixed_sq = torch.clamp(sigma_fixed_sq, min=self.eps)
             sigma_warped_sq = torch.clamp(sigma_warped_sq, min=self.eps)
         
-        # Compute LNCC
+        # Compute LNCC with better numerical stability
         numerator = sigma_fixed_warped
-        denominator = torch.sqrt(sigma_fixed_sq * sigma_warped_sq + self.eps)
+        
+        # More aggressive numerical stability measures
+        denominator_sq = sigma_fixed_sq * sigma_warped_sq
+        denominator_sq = torch.clamp(denominator_sq, min=self.eps*self.eps)
+        denominator = torch.sqrt(denominator_sq)
+        denominator = torch.clamp(denominator, min=self.eps)
+        
         lncc = numerator / denominator
+        
+        # Clamp LNCC to reasonable range to prevent extreme values
+        lncc = torch.clamp(lncc, min=-10.0, max=10.0)
+        
+        # Handle NaN/Inf values
+        lncc = torch.nan_to_num(lncc, nan=0.0, posinf=1.0, neginf=-1.0)
         
         # Debug LNCC
         print(f"[DEBUG] LNCC:")
@@ -91,7 +103,11 @@ class LocalNormalizedCrossCorrelation(nn.Module):
         print(f"lncc has NaN: {torch.isnan(lncc).any().item()}")
         
         # Return negative mean LNCC (to minimize)
-        return -lncc.mean()
+        loss = -lncc.mean()
+        
+        print(f"[DEBUG] Raw similarity loss: {loss.item():.4f}, is NaN: {torch.isnan(loss).any().item()}")
+        
+        return loss
 
 
 class MutualInformation(nn.Module):
