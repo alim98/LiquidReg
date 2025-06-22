@@ -60,7 +60,7 @@ training:
   grad_clip_norm: 1.0
   
   # Mixed precision
-  use_amp: true
+  use_amp: false
   
   # Early stopping
   early_stopping_patience: 20

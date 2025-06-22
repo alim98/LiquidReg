@@ -26,7 +26,7 @@ def _read_pairs_csv(csv_path: Path) -> List[Tuple[int, int]]:
                 pairs.append((fid, mid))
             except (KeyError, ValueError, TypeError):
                 continue
-    # print(f"[DEBUG] _read_pairs_csv: read {len(pairs)} pairs from '{csv_path}'.")
+
     return pairs
 
 
@@ -64,29 +64,18 @@ class L2RTask3Dataset(Dataset):
 
         
         self.volumes = self._discover_volumes()
-        # print(f"[DEBUG] Split '{self.split}': discovered {len(self.volumes)} volumes in '{self.data_dir}'.")
-        # if self.volumes:
-        #     print(f"[DEBUG] First 5 volume IDs: {[v['id'] for v in self.volumes[:5]]} ...")
 
         if len(self.volumes) == 0:
             # If no volumes found, print diagnostic information
             candidate_imgs = list(self.data_dir.glob("img*.nii.gz"))
-            # print(f"[DEBUG] glob('img*.nii.gz') returned {len(candidate_imgs)} matches")
-            # if candidate_imgs:
-            #     print(f"[DEBUG] Example files: {[p.name for p in candidate_imgs[:5]]}")
 
         
         if self.split == "val" and self.pairs_csv is not None:
             self.pairs = self._pairs_from_csv()
-            # print(f"[DEBUG] Attempting to read validation pairs from CSV: {self.pairs_csv}")
             if len(self.pairs) == 0:
-                # print("[DEBUG] CSV yielded 0 valid pairs -> falling back to random generation")
                 self.pairs = self._generate_pairs(len(self.volumes) * 2)
-            # else:
-                # print(f"[DEBUG] Loaded {len(self.pairs)} pairs from CSV")
         else:
             self.pairs = self._generate_pairs(len(self.volumes) * 2)
-            # print(f"[DEBUG] Generated {len(self.pairs)} random pairs for split '{self.split}'.")
 
     
     def _discover_volumes(self) -> List[dict]:

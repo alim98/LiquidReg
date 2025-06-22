@@ -201,7 +201,7 @@ def train_epoch(
             continue
         
         # Backward pass
-        if use_amp and scaler is not None:
+        if use_amp and hasattr(scaler, 'scale'):
             try:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -224,6 +224,21 @@ def train_epoch(
                 
                 scaler.step(optimizer)
                 scaler.update()
+            except ValueError as e:
+                if "Attempting to unscale FP16 gradients" in str(e):
+                    # Fallback to non-AMP training for this batch
+                    optimizer.zero_grad()
+                    loss.backward()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), 
+                        config['training']['grad_clip_norm']
+                    )
+                    optimizer.step()
+                else:
+                    print(f"[ERROR] Exception in backward pass: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
             except Exception as e:
                 print(f"[ERROR] Exception in backward pass: {e}")
                 import traceback
@@ -568,10 +583,15 @@ def main():
     )
     
     # Mixed precision scaler
-    # Fix deprecated GradScaler API
     if config['training']['use_amp'] and device.type == 'cuda':
-        from torch.cuda.amp import GradScaler
-        scaler = GradScaler()
+        try:
+            # Try new API first
+            from torch.amp import GradScaler
+            scaler = GradScaler('cuda')
+        except (ImportError, TypeError):
+            # Fallback to old API
+            from torch.cuda.amp import GradScaler
+            scaler = GradScaler()
     else:
         # For CPU or when AMP is disabled, create a dummy scaler
         class DummyScaler:
