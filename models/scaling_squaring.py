@@ -40,11 +40,7 @@ class ScalingSquaring(nn.Module):
         Returns:
             deformation: Deformation field (B, 3, D, H, W)
         """
-        # Debug input
-        print(f"[DEBUG] ScalingSquaring input:")
-        print(f"Velocity shape: {velocity.shape}")
-        print(f"Velocity min/max/mean: {velocity.min().item():.4f}/{velocity.max().item():.4f}/{velocity.mean().item():.4f}")
-        print(f"Velocity has NaN: {torch.isnan(velocity).any().item()}")
+
         
         # Scale velocity field for integration
         scaled_velocity = velocity / (2 ** self.num_squaring)
@@ -56,17 +52,10 @@ class ScalingSquaring(nn.Module):
         for _ in range(self.num_squaring):
             deformation = self.compose_deformations(deformation, deformation)
             
-            # Debug intermediate deformation
-            if torch.isnan(deformation).any():
-                print(f"[WARNING] NaN values detected in deformation field during squaring")
-                # Replace NaNs with zeros to prevent propagation
-                deformation = torch.nan_to_num(deformation, nan=0.0)
+            # Check for NaNs and fix them
+            deformation = torch.nan_to_num(deformation, nan=0.0)
         
-        # Debug output
-        print(f"[DEBUG] ScalingSquaring output:")
-        print(f"Deformation shape: {deformation.shape}")
-        print(f"Deformation min/max/mean: {deformation.min().item():.4f}/{deformation.max().item():.4f}/{deformation.mean().item():.4f}")
-        print(f"Deformation has NaN: {torch.isnan(deformation).any().item()}")
+
         
         return deformation
     
@@ -85,11 +74,7 @@ class ScalingSquaring(nn.Module):
         Returns:
             composed: Composed deformation field (B, 3, D, H, W)
         """
-        # Debug inputs
-        print(f"[DEBUG] Compose deformations inputs:")
-        print(f"flow1 min/max/mean: {flow1.min().item():.4f}/{flow1.max().item():.4f}/{flow1.mean().item():.4f}")
-        print(f"flow2 min/max/mean: {flow2.min().item():.4f}/{flow2.max().item():.4f}/{flow2.mean().item():.4f}")
-        print(f"flow1 has NaN: {torch.isnan(flow1).any().item()}, flow2 has NaN: {torch.isnan(flow2).any().item()}")
+
         
         # Create sampling grid
         grid = self.get_grid(flow1)
@@ -97,19 +82,13 @@ class ScalingSquaring(nn.Module):
         # Apply flow2 to get intermediate positions
         sample_grid = grid + flow2.permute(0, 2, 3, 4, 1)
         
-        # Check for extreme values in sample_grid
-        if torch.isnan(sample_grid).any():
-            print(f"[WARNING] NaN values detected in sample_grid")
-            sample_grid = torch.nan_to_num(sample_grid, nan=0.0)
+        # Check for NaNs and fix them
+        sample_grid = torch.nan_to_num(sample_grid, nan=0.0)
         
         # Normalize grid to [-1, 1] for grid_sample
         sample_grid = self.normalize_grid(sample_grid, flow1.shape[2:])
         
-        # Check for values outside [-1, 1] which could cause issues in grid_sample
-        if (sample_grid.abs() > 1.0).any():
-            print(f"[WARNING] Sample grid values outside [-1, 1] range: {(sample_grid.abs() > 1.0).sum().item()} values")
-        
-        # Always clamp to valid range with small margin to prevent boundary issues
+        # Clamp to valid range with small margin to prevent boundary issues
         sample_grid = torch.clamp(sample_grid, -0.999, 0.999)
         
         # Sample flow1 at displaced positions
@@ -121,18 +100,13 @@ class ScalingSquaring(nn.Module):
             align_corners=self.align_corners
         )
         
-        # Check for NaNs in sampled flow
-        if torch.isnan(flow1_displaced).any():
-            print(f"[WARNING] NaN values detected after grid_sample")
-            flow1_displaced = torch.nan_to_num(flow1_displaced, nan=0.0)
+        # Check for NaNs and fix them
+        flow1_displaced = torch.nan_to_num(flow1_displaced, nan=0.0)
         
         # Compose: φ(x) = φ1(x + φ2(x)) + φ2(x)
         composed = flow1_displaced + flow2
         
-        # Debug output
-        print(f"[DEBUG] Composed deformation:")
-        print(f"min/max/mean: {composed.min().item():.4f}/{composed.max().item():.4f}/{composed.mean().item():.4f}")
-        print(f"has NaN: {torch.isnan(composed).any().item()}")
+
         
         return composed
     
@@ -282,11 +256,7 @@ def compute_jacobian_determinant(flow: torch.Tensor) -> torch.Tensor:
     """
     B, _, D, H, W = flow.shape
     
-    # Debug input
-    print(f"[DEBUG] Jacobian input flow:")
-    print(f"Shape: {flow.shape}")
-    print(f"Min/max/mean: {flow.min().item():.4f}/{flow.max().item():.4f}/{flow.mean().item():.4f}")
-    print(f"Has NaN: {torch.isnan(flow).any().item()}")
+
     
     # Compute gradients using central differences
     # Note: This reduces spatial dimensions by 2 in each direction
@@ -306,47 +276,30 @@ def compute_jacobian_determinant(flow: torch.Tensor) -> torch.Tensor:
     dvdz = (flow[:, 1, 2:, 1:-1, 1:-1] - flow[:, 1, :-2, 1:-1, 1:-1]) / 2
     dwdz = (flow[:, 2, 2:, 1:-1, 1:-1] - flow[:, 2, :-2, 1:-1, 1:-1]) / 2
     
-    # Debug gradients
-    print(f"[DEBUG] Gradients:")
-    print(f"dudx min/max/mean: {dudx.min().item():.4f}/{dudx.max().item():.4f}/{dudx.mean().item():.4f}")
-    print(f"dvdy min/max/mean: {dvdy.min().item():.4f}/{dvdy.max().item():.4f}/{dvdy.mean().item():.4f}")
-    print(f"dwdz min/max/mean: {dwdz.min().item():.4f}/{dwdz.max().item():.4f}/{dwdz.mean().item():.4f}")
+
     
     # Add identity matrix
     dudx = dudx + 1
     dvdy = dvdy + 1
     dwdz = dwdz + 1
     
-    # Check for extreme values that could cause numerical instability
-    max_grad = 10.0  # Arbitrary threshold
-    if dudx.abs().max() > max_grad or dvdy.abs().max() > max_grad or dwdz.abs().max() > max_grad:
-        print(f"[WARNING] Extreme gradient values detected in Jacobian computation")
-        # Clip to reasonable range
-        dudx = torch.clamp(dudx, -max_grad, max_grad)
-        dvdy = torch.clamp(dvdy, -max_grad, max_grad)
-        dwdz = torch.clamp(dwdz, -max_grad, max_grad)
-        dudy = torch.clamp(dudy, -max_grad, max_grad)
-        dudz = torch.clamp(dudz, -max_grad, max_grad)
-        dvdx = torch.clamp(dvdx, -max_grad, max_grad)
-        dvdz = torch.clamp(dvdz, -max_grad, max_grad)
-        dwdx = torch.clamp(dwdx, -max_grad, max_grad)
-        dwdy = torch.clamp(dwdy, -max_grad, max_grad)
+    # Check for extreme values and clip to prevent numerical instability
+    max_grad = 10.0
+    dudx = torch.clamp(dudx, -max_grad, max_grad)
+    dvdy = torch.clamp(dvdy, -max_grad, max_grad)
+    dwdz = torch.clamp(dwdz, -max_grad, max_grad)
+    dudy = torch.clamp(dudy, -max_grad, max_grad)
+    dudz = torch.clamp(dudz, -max_grad, max_grad)
+    dvdx = torch.clamp(dvdx, -max_grad, max_grad)
+    dvdz = torch.clamp(dvdz, -max_grad, max_grad)
+    dwdx = torch.clamp(dwdx, -max_grad, max_grad)
+    dwdy = torch.clamp(dwdy, -max_grad, max_grad)
     
     # Compute determinant
     det = dudx * (dvdy * dwdz - dvdz * dwdy) - \
           dudy * (dvdx * dwdz - dvdz * dwdx) + \
           dudz * (dvdx * dwdy - dvdy * dwdx)
     
-    # Debug determinant
-    print(f"[DEBUG] Determinant:")
-    print(f"Shape: {det.shape}")
-    print(f"Min/max/mean: {det.min().item():.4f}/{det.max().item():.4f}/{det.mean().item():.4f}")
-    print(f"Negative values: {(det < 0).sum().item()}")
-    print(f"Has NaN: {torch.isnan(det).any().item()}")
-    
-    # Handle negative determinants (folding) by taking absolute value
-    # This preserves the penalty but prevents NaN in log operations
-    if (det < 0).any():
-        print(f"[WARNING] Negative Jacobian determinants detected: {(det < 0).sum().item()} values")
+
     
     return det.unsqueeze(1) 

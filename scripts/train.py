@@ -157,12 +157,7 @@ def train_epoch(
         fixed = batch['fixed'].float()
         moving = batch['moving'].float()
         
-        # Debug: Check input data
-        print(f"\n[DEBUG] Batch {batch_idx} - Input stats:")
-        print(f"Fixed min/max/mean: {fixed.min().item():.4f}/{fixed.max().item():.4f}/{fixed.mean().item():.4f}")
-        print(f"Moving min/max/mean: {moving.min().item():.4f}/{moving.max().item():.4f}/{moving.mean().item():.4f}")
-        print(f"Fixed shape: {fixed.shape}, Moving shape: {moving.shape}")
-        print(f"Fixed has NaN: {torch.isnan(fixed).any().item()}, Moving has NaN: {torch.isnan(moving).any().item()}")
+
         
         # Move to device
         device = next(model.parameters()).device
@@ -186,22 +181,10 @@ def train_epoch(
             with autocast_context:
                 output = model(fixed, moving, return_intermediate=True)
                 
-                # Debug: Check model outputs
-                print(f"[DEBUG] Model outputs:")
                 warped = output['warped_moving']
                 velocity = output['velocity_field']
                 jacobian_det = output['jacobian_det']
                 liquid_params = output['liquid_params']
-                
-                print(f"Warped min/max/mean: {warped.min().item():.4f}/{warped.max().item():.4f}/{warped.mean().item():.4f}")
-                print(f"Velocity min/max/mean: {velocity.min().item():.4f}/{velocity.max().item():.4f}/{velocity.mean().item():.4f}")
-                print(f"Jacobian det min/max/mean: {jacobian_det.min().item():.4f}/{jacobian_det.max().item():.4f}/{jacobian_det.mean().item():.4f}")
-                print(f"Liquid params min/max/mean: {liquid_params.min().item():.4f}/{liquid_params.max().item():.4f}/{liquid_params.mean().item():.4f}")
-                
-                print(f"Warped has NaN: {torch.isnan(warped).any().item()}")
-                print(f"Velocity has NaN: {torch.isnan(velocity).any().item()}")
-                print(f"Jacobian has NaN: {torch.isnan(jacobian_det).any().item()}")
-                print(f"Liquid params has NaN: {torch.isnan(liquid_params).any().item()}")
                 
                 # Compute losses
                 losses = criterion(
@@ -212,11 +195,7 @@ def train_epoch(
                     liquid_params=liquid_params
                 )
                 
-                # Debug: Check losses
-                print(f"[DEBUG] Losses:")
-                for key, value in losses.items():
-                    if isinstance(value, torch.Tensor):
-                        print(f"{key}: {value.item():.4f}, is NaN: {torch.isnan(value).item()}")
+
                 
                 loss = losses['total']
         except Exception as e:
@@ -237,18 +216,14 @@ def train_epoch(
                     config['training']['grad_clip_norm']
                 )
                 
-                # Debug: Check gradients
-                print(f"[DEBUG] Gradient norm: {grad_norm.item():.4f}, is NaN: {torch.isnan(grad_norm).item()}")
-                
                 # Check for NaN gradients
                 has_nan_grad = False
                 for name, param in model.named_parameters():
                     if param.grad is not None and torch.isnan(param.grad).any():
-                        print(f"[WARNING] NaN gradient in {name}")
                         has_nan_grad = True
+                        break
                 
                 if has_nan_grad:
-                    print("[WARNING] NaN gradients detected, skipping optimizer step")
                     continue
                 
                 scaler.step(optimizer)
@@ -267,18 +242,14 @@ def train_epoch(
                     config['training']['grad_clip_norm']
                 )
                 
-                # Debug: Check gradients
-                print(f"[DEBUG] Gradient norm: {grad_norm.item():.4f}, is NaN: {torch.isnan(grad_norm).item()}")
-                
                 # Check for NaN gradients
                 has_nan_grad = False
                 for name, param in model.named_parameters():
                     if param.grad is not None and torch.isnan(param.grad).any():
-                        print(f"[WARNING] NaN gradient in {name}")
                         has_nan_grad = True
+                        break
                 
                 if has_nan_grad:
-                    print("[WARNING] NaN gradients detected, skipping optimizer step")
                     continue
                 
                 optimizer.step()
@@ -601,11 +572,7 @@ def main():
     )
     
     # Mixed precision scaler
-    # Use the updated GradScaler API
-    if config['training']['use_amp']:
-        try:
-            # Try new API first
-            # Fix deprecated GradScaler API
+    # Fix deprecated GradScaler API
     if config['training']['use_amp'] and device.type == 'cuda':
         from torch.cuda.amp import GradScaler
         scaler = GradScaler()
@@ -617,12 +584,6 @@ def main():
             def update(self): pass
             def unscale_(self, optimizer): pass
         scaler = DummyScaler()
-        except TypeError:
-            # Fallback to old API
-            from torch.cuda.amp import GradScaler as CudaGradScaler
-            scaler = CudaGradScaler(enabled=config['training']['use_amp'])
-    else:
-        scaler = None
     
     # Training loop
     early_stopping_counter = 0

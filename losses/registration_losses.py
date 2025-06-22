@@ -36,12 +36,7 @@ class LocalNormalizedCrossCorrelation(nn.Module):
         Returns:
             lncc: LNCC loss (scalar)
         """
-        # Debug
-        print(f"[DEBUG] LNCC inputs:")
-        print(f"Fixed shape: {fixed.shape}, Warped shape: {warped.shape}")
-        print(f"Fixed min/max/mean: {fixed.min().item():.4f}/{fixed.max().item():.4f}/{fixed.mean().item():.4f}")
-        print(f"Warped min/max/mean: {warped.min().item():.4f}/{warped.max().item():.4f}/{warped.mean().item():.4f}")
-        print(f"Fixed has NaN: {torch.isnan(fixed).any().item()}, Warped has NaN: {torch.isnan(warped).any().item()}")
+
         
         # Pad inputs
         pad = self.window_size // 2
@@ -52,10 +47,7 @@ class LocalNormalizedCrossCorrelation(nn.Module):
         mu_fixed = F.conv3d(fixed, self.kernel, padding=0)
         mu_warped = F.conv3d(warped, self.kernel, padding=0)
         
-        # Debug means
-        print(f"[DEBUG] Means:")
-        print(f"mu_fixed min/max/mean: {mu_fixed.min().item():.4f}/{mu_fixed.max().item():.4f}/{mu_fixed.mean().item():.4f}")
-        print(f"mu_warped min/max/mean: {mu_warped.min().item():.4f}/{mu_warped.max().item():.4f}/{mu_warped.mean().item():.4f}")
+
         
         # Compute local variances and covariance
         mu_fixed_sq = mu_fixed ** 2
@@ -66,17 +58,9 @@ class LocalNormalizedCrossCorrelation(nn.Module):
         sigma_warped_sq = F.conv3d(warped ** 2, self.kernel, padding=0) - mu_warped_sq
         sigma_fixed_warped = F.conv3d(fixed * warped, self.kernel, padding=0) - mu_fixed_warped
         
-        # Debug variances
-        print(f"[DEBUG] Variances:")
-        print(f"sigma_fixed_sq min/max/mean: {sigma_fixed_sq.min().item():.4f}/{sigma_fixed_sq.max().item():.4f}/{sigma_fixed_sq.mean().item():.4f}")
-        print(f"sigma_warped_sq min/max/mean: {sigma_warped_sq.min().item():.4f}/{sigma_warped_sq.max().item():.4f}/{sigma_warped_sq.mean().item():.4f}")
-        print(f"sigma_fixed_warped min/max/mean: {sigma_fixed_warped.min().item():.4f}/{sigma_fixed_warped.max().item():.4f}/{sigma_fixed_warped.mean().item():.4f}")
-        
-        # Check for negative variances (numerical errors)
-        if (sigma_fixed_sq < 0).any() or (sigma_warped_sq < 0).any():
-            print("[WARNING] Negative variance detected in LNCC computation")
-            sigma_fixed_sq = torch.clamp(sigma_fixed_sq, min=self.eps)
-            sigma_warped_sq = torch.clamp(sigma_warped_sq, min=self.eps)
+        # Check for negative variances and fix them
+        sigma_fixed_sq = torch.clamp(sigma_fixed_sq, min=self.eps)
+        sigma_warped_sq = torch.clamp(sigma_warped_sq, min=self.eps)
         
         # Compute LNCC with better numerical stability
         numerator = sigma_fixed_warped
@@ -95,17 +79,12 @@ class LocalNormalizedCrossCorrelation(nn.Module):
         # Handle NaN/Inf values
         lncc = torch.nan_to_num(lncc, nan=0.0, posinf=1.0, neginf=-1.0)
         
-        # Debug LNCC
-        print(f"[DEBUG] LNCC:")
-        print(f"numerator min/max/mean: {numerator.min().item():.4f}/{numerator.max().item():.4f}/{numerator.mean().item():.4f}")
-        print(f"denominator min/max/mean: {denominator.min().item():.4f}/{denominator.max().item():.4f}/{denominator.mean().item():.4f}")
-        print(f"lncc min/max/mean: {lncc.min().item():.4f}/{lncc.max().item():.4f}/{lncc.mean().item():.4f}")
-        print(f"lncc has NaN: {torch.isnan(lncc).any().item()}")
+
         
         # Return negative mean LNCC (to minimize)
         loss = -lncc.mean()
         
-        print(f"[DEBUG] Raw similarity loss: {loss.item():.4f}, is NaN: {torch.isnan(loss).any().item()}")
+
         
         return loss
 
@@ -201,11 +180,7 @@ class JacobianDeterminantLoss(nn.Module):
         Returns:
             penalty: Jacobian penalty
         """
-        # Debug
-        print(f"[DEBUG] Jacobian det stats:")
-        print(f"Min: {jacobian_det.min().item():.4f}, Max: {jacobian_det.max().item():.4f}, Mean: {jacobian_det.mean().item():.4f}")
-        print(f"Negative values: {(jacobian_det < 0).sum().item()}")
-        print(f"Has NaN: {torch.isnan(jacobian_det).any().item()}")
+
         
         if self.penalty_type == "l2":
             # Penalize deviations from 1
@@ -214,12 +189,11 @@ class JacobianDeterminantLoss(nn.Module):
             # Log-penalty (more stable)
             # Clamp to avoid negative values
             jacobian_det_clamped = jacobian_det.clamp(min=1e-6)
-            print(f"[DEBUG] Clamped jacobian min: {jacobian_det_clamped.min().item():.6f}")
             penalty = (torch.log(jacobian_det_clamped) ** 2).mean()
         else:
             raise ValueError(f"Unknown penalty type: {self.penalty_type}")
         
-        print(f"[DEBUG] Jacobian penalty: {penalty.item():.4f}, is NaN: {torch.isnan(penalty).item()}")
+
         
         return penalty
 
@@ -376,71 +350,46 @@ class CompositeLoss(nn.Module):
         Returns:
             losses: Dictionary of loss components and total loss
         """
-        # Debug input statistics
-        print(f"\n[DEBUG] Loss inputs:")
-        print(f"Fixed min/max/mean: {fixed.min().item():.4f}/{fixed.max().item():.4f}/{fixed.mean().item():.4f}")
-        print(f"Warped min/max/mean: {warped.min().item():.4f}/{warped.max().item():.4f}/{warped.mean().item():.4f}")
-        print(f"Velocity min/max/mean: {velocity_field.min().item():.4f}/{velocity_field.max().item():.4f}/{velocity_field.mean().item():.4f}")
-        print(f"Jacobian min/max/mean: {jacobian_det.min().item():.4f}/{jacobian_det.max().item():.4f}/{jacobian_det.mean().item():.4f}")
-        print(f"Liquid params min/max/mean: {liquid_params.min().item():.4f}/{liquid_params.max().item():.4f}/{liquid_params.mean().item():.4f}")
-        
-        # Check for NaNs in inputs
-        print(f"Fixed has NaN: {torch.isnan(fixed).any().item()}")
-        print(f"Warped has NaN: {torch.isnan(warped).any().item()}")
-        print(f"Velocity has NaN: {torch.isnan(velocity_field).any().item()}")
-        print(f"Jacobian has NaN: {torch.isnan(jacobian_det).any().item()}")
-        print(f"Liquid params has NaN: {torch.isnan(liquid_params).any().item()}")
+
         
         losses = {}
         
         # Similarity loss
         try:
             similarity_loss = self.similarity_loss(fixed, warped)
-            print(f"[DEBUG] Raw similarity loss: {similarity_loss.item():.4f}, is NaN: {torch.isnan(similarity_loss).item()}")
             losses['similarity'] = self.lambda_similarity * similarity_loss
         except Exception as e:
             print(f"[ERROR] Exception in similarity loss: {e}")
-            import traceback
-            traceback.print_exc()
             losses['similarity'] = torch.tensor(0.0, device=fixed.device)
         
         # Jacobian determinant penalty
         try:
             jacobian_loss = self.jacobian_loss(jacobian_det)
-            print(f"[DEBUG] Raw jacobian loss: {jacobian_loss.item():.4f}, is NaN: {torch.isnan(jacobian_loss).item()}")
             losses['jacobian'] = self.lambda_jacobian * jacobian_loss
         except Exception as e:
             print(f"[ERROR] Exception in jacobian loss: {e}")
-            import traceback
-            traceback.print_exc()
             losses['jacobian'] = torch.tensor(0.0, device=fixed.device)
         
         # Velocity regularization
         try:
             velocity_reg = self.velocity_reg(velocity_field)
-            print(f"[DEBUG] Raw velocity reg: {velocity_reg.item():.4f}, is NaN: {torch.isnan(velocity_reg).item()}")
             losses['velocity_reg'] = self.lambda_velocity * velocity_reg
         except Exception as e:
             print(f"[ERROR] Exception in velocity regularization: {e}")
-            import traceback
-            traceback.print_exc()
             losses['velocity_reg'] = torch.tensor(0.0, device=fixed.device)
         
         # Liquid stability
         try:
             liquid_stability = self.liquid_stability(liquid_params)
-            print(f"[DEBUG] Raw liquid stability: {liquid_stability.item():.4f}, is NaN: {torch.isnan(liquid_stability).item()}")
             losses['liquid_stability'] = self.lambda_liquid * liquid_stability
         except Exception as e:
             print(f"[ERROR] Exception in liquid stability: {e}")
-            import traceback
-            traceback.print_exc()
             losses['liquid_stability'] = torch.tensor(0.0, device=fixed.device)
         
         # Total loss
         total_loss = sum(losses.values())
         losses['total'] = total_loss
         
-        print(f"[DEBUG] Total loss: {total_loss.item():.4f}, is NaN: {torch.isnan(total_loss).item()}")
+
         
         return losses 
