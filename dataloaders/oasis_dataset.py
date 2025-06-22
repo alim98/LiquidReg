@@ -192,8 +192,15 @@ class L2RTask3Dataset(Dataset):
         )
 
         if not fixed_patches:
-            raise RuntimeError("Failed to extract patches from volume")
-
+            raise RuntimeError("Failed to extract patches from fixed volume")
+            
+        if not moving_patches:
+            raise RuntimeError("Failed to extract patches from moving volume")
+        
+        # Ensure we only consider indices that are valid for both patch lists
+        max_valid_idx = min(len(fixed_patches), len(moving_patches)) - 1
+        if max_valid_idx < 0:
+            raise RuntimeError("No valid patches found in both volumes")
         
         # ------------------------------------------------------------------
         # Brain-coverage filter: keep sampling until a patch contains a minimum
@@ -218,13 +225,13 @@ class L2RTask3Dataset(Dataset):
         max_attempts = 20
         patch_idx = None
         for _ in range(max_attempts):
-            cand_idx = random.randint(0, len(fixed_patches) - 1)
-            if _is_valid(fixed_patches[cand_idx]):
+            cand_idx = random.randint(0, max_valid_idx)
+            if _is_valid(fixed_patches[cand_idx]) and _is_valid(moving_patches[cand_idx]):
                 patch_idx = cand_idx
                 break
 
         if patch_idx is None:  # fallback if no suitable patch found
-            patch_idx = random.randint(0, len(fixed_patches) - 1)
+            patch_idx = random.randint(0, max_valid_idx)
 
         fixed_patch = fixed_patches[patch_idx]
         moving_patch = moving_patches[patch_idx]
@@ -268,7 +275,9 @@ class L2RTask3Dataset(Dataset):
                 self.patch_stride,
             )
 
-            if fixed_label_patches and patch_idx < len(fixed_label_patches):
+            # Only add segmentation if we have valid patches for both and the patch_idx is in range
+            if (fixed_label_patches and moving_label_patches and 
+                patch_idx < len(fixed_label_patches) and patch_idx < len(moving_label_patches)):
                 fixed_label_patch = fixed_label_patches[patch_idx]
                 moving_label_patch = moving_label_patches[patch_idx]
                 output["segmentation_fixed"] = fixed_label_patch  # Keep channel dimension

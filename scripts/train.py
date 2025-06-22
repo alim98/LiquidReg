@@ -273,24 +273,35 @@ def validate_epoch(
             fixed = fixed.to(device)
             moving = moving.to(device)
             
-            # Forward pass
-            output = model(fixed, moving, return_intermediate=True)
+            # Forward pass with mixed precision
+            use_amp = config['training']['use_amp']
+            try:
+                # Try new API first
+                from torch.amp import autocast
+                autocast_context = autocast(device_type=device.type, enabled=use_amp)
+            except TypeError:
+                # Fallback to old API
+                from torch.cuda.amp import autocast as cuda_autocast
+                autocast_context = cuda_autocast(enabled=use_amp)
             
-            warped = output['warped_moving']
-            velocity = output['velocity_field']
-            jacobian_det = output['jacobian_det']
-            liquid_params = output['liquid_params']
-            
-            # Compute losses
-            losses = criterion(
-                fixed=fixed,
-                warped=warped,
-                velocity_field=velocity,
-                jacobian_det=jacobian_det,
-                liquid_params=liquid_params
-            )
-            
-            loss = losses['total']
+            with autocast_context:
+                output = model(fixed, moving, return_intermediate=True)
+                
+                warped = output['warped_moving']
+                velocity = output['velocity_field']
+                jacobian_det = output['jacobian_det']
+                liquid_params = output['liquid_params']
+                
+                # Compute losses
+                losses = criterion(
+                    fixed=fixed,
+                    warped=warped,
+                    velocity_field=velocity,
+                    jacobian_det=jacobian_det,
+                    liquid_params=liquid_params
+                )
+                
+                loss = losses['total']
             
             # Accumulate losses
             total_loss += loss.item()
