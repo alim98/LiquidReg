@@ -1,0 +1,91 @@
+# =========================
+# LiquidReg Super-Light Test Config
+# =========================
+
+# -------- Model --------
+model:
+  name: "LiquidReg"
+  image_size: [64, 64, 64]      # half resolution
+  encoder_type: "cnn"
+  encoder_channels: 64          # much smaller
+  liquid_hidden_dim: 16
+  liquid_num_steps: 2           # very few ODE steps
+  velocity_scale: 1.0
+  num_squaring: 2               # very shallow squaring
+  fusion_type: "concat_pool"
+
+# -------- Data (pairs-CSV) --------
+data:
+  train_pairs: "data/OASIS_train/pairs_train.csv"
+  val_pairs:   "data/OASIS_val/pairs_val.csv"
+  test_pairs:  null
+
+  batch_size: 1                  # safest for 4GB
+  num_workers: 2
+  pin_memory: false
+
+  patch_size: 32
+  patch_stride: 16
+  patches_per_pair: 4            # drastically reduced
+
+  use_augmentation: false
+  augmentation_prob: 0.0
+
+  use_labels_train: false
+  use_labels_val:   false
+
+# -------- Training --------
+training:
+  num_epochs: 2                  # just to smoke test
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-6
+  optimizer: "adam"
+  scheduler: "cosine"
+
+  lambda_similarity: 1.0
+  lambda_jacobian: 0.0
+  lambda_velocity: 0.0
+  lambda_liquid: 0.0
+
+  similarity_loss: "mse"
+  lncc_window: 5
+  jacobian_penalty: "l2"
+
+  grad_clip_norm: 1.0
+  use_amp: true                  # essential for small GPU
+
+  early_stopping_patience: 5
+  early_stopping_delta: 1.0e-3
+
+# -------- Validation --------
+validation:
+  eval_interval: 1
+  save_best: false
+  save_last: true
+  compute_metrics: false         # skip heavy metrics
+
+# -------- Logging --------
+logging:
+  log_dir: "runs_light"
+  experiment_name: "liquidreg_smoketest"
+  log_interval: 5
+  save_interval: 1
+  wandb: false
+  tensorboard: false             # disable to save VRAM/CPU
+
+# -------- Hardware --------
+device:
+  gpu_ids: [0]
+  mixed_precision: true
+  compile_model: false
+
+# -------- Repro --------
+seed: 123
+deterministic: false
+
+# -------- Metrics / Viz --------
+metrics:
+  compute_dice: false
+  compute_jacobian_stats: false
+  compute_deformation_magnitude: false
+  save_visualizations: false

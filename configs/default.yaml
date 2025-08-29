@@ -1,101 +1,93 @@
-# LiquidReg Default Configuration
+# =========================
+# LiquidReg Paper Baseline
+# =========================
 
-# Model Configuration
+# -------- Model --------
 model:
   name: "LiquidReg"
   image_size: [128, 128, 128]
-  encoder_type: "cnn"  # "cnn" or "swin"
+  encoder_type: "cnn"          # "cnn" or "swin"
   encoder_channels: 256
   liquid_hidden_dim: 64
-  liquid_num_steps: 8
+  liquid_num_steps: 10
   velocity_scale: 1.0
   num_squaring: 6
-  fusion_type: "concat_pool"  # "concat_pool", "attention", "gated"
+  fusion_type: "concat_pool"   # ablate: "attention", "gated"
 
-# Data Configuration
+# -------- Data (pairs-CSV) --------
 data:
-  data_root: "data"
-  train_dir: "L2R_2021_Task3_train"
-  val_dir: "L2R_2021_Task3_val"
-  test_dir: null
-  batch_size: 1
-  num_workers: 4
-  pin_memory: true
-  
-  # # Patch settings
-  # patch_size: 64
-  # patch_stride: 32
-  # patches_per_pair: 20
-  
-  # Patch settings
-  patch_size: 32
-  patch_stride: 16
-  patches_per_pair: 10
-  
-  # Preprocessing
-  normalize_method: "zscore"  # "zscore", "minmax", "percentile"
-  use_augmentation: true
-  augmentation_prob: 0.5
+  train_pairs: "data/OASIS_train/pairs_train.csv"
+  val_pairs:   "data/OASIS_val/pairs_val.csv"
+  test_pairs:  "data/OASIS_test/pairs_test.csv"
 
-# Training Configuration
+  batch_size: 2
+  num_workers: 8
+  pin_memory: true
+
+  patch_size: 64
+  patch_stride: 32
+  patches_per_pair: 32
+
+  use_augmentation: true
+  augmentation_prob: 0.8
+
+  use_labels_train: true
+  use_labels_val:   true
+
+# -------- Training --------
 training:
-  num_epochs: 1
-  learning_rate: 1.0e-4
-  weight_decay: 1.0e-6
-  optimizer: "adamw"  # "adam", "adamw", "sgd"
-  scheduler: "cosine"  # "cosine", "step", "plateau"
-  
+  num_epochs: 300
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-4
+  optimizer: "adamw"            # "adam", "adamw", "sgd"
+  scheduler: "cosine"           # "cosine", "step", "plateau"
+
   # Loss weights
   lambda_similarity: 1.0
-  lambda_jacobian: 1.0
+  lambda_jacobian: 0.5
   lambda_velocity: 0.01
   lambda_liquid: 0.001
-  
-  # Loss configuration
-  similarity_loss: "lncc"  # "lncc", "mse", "mi"
+
+  similarity_loss: "lncc"       # "lncc", "mse", "mi"
   lncc_window: 9
-  jacobian_penalty: "l2"  # "l2", "log"
-  
-  # Gradient clipping
+  jacobian_penalty: "l2"        # "l2", "log"
+
   grad_clip_norm: 1.0
-  
-  # Mixed precision
-  use_amp: false
-  
-  # Early stopping
-  early_stopping_patience: 20
+  use_amp: true
+
+  early_stopping_patience: 30
   early_stopping_delta: 1.0e-4
 
-# Validation Configuration
+# -------- Validation --------
 validation:
-  eval_interval: 5  # epochs
-  save_best: true
+  eval_interval: 1              # validate every epoch
+  save_best: true               # best = lowest val loss
   save_last: true
   compute_metrics: true
 
-# Logging Configuration
+# -------- Logging --------
 logging:
-  log_dir: "logs"
-  experiment_name: "liquidreg_default"
-  log_interval: 10  # batches
-  save_interval: 20  # epochs
+  log_dir: "runs"
+  experiment_name: "liquidreg_paper_baseline"
+  log_interval: 50
+  save_interval: 25
   wandb: false
   tensorboard: true
 
-# Hardware Configuration
+# -------- Hardware --------
 device:
   gpu_ids: [0]
   mixed_precision: true
-  compile_model: false  # PyTorch 2.0 compile
+  compile_model: true           # PyTorch 2.x compile; set false if unstable
 
-# Reproducibility
+# -------- Repro --------
 seed: 42
-deterministic: false  # Set to true for full reproducibility (slower)
+deterministic: true
 
-# Evaluation Metrics
+# -------- Metrics / Viz --------
 metrics:
-  compute_dice: true
+  compute_dice: true            # still logged during eval if segs exist
   compute_jacobian_stats: true
   compute_deformation_magnitude: true
   save_visualizations: true
-  num_vis_samples: 5 
+  num_vis_samples: 5

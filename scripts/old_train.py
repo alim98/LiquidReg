@@ -28,13 +28,6 @@ from dataloaders.oasis_dataset import create_oasis_loaders
 from losses.registration_losses import CompositeLoss
 from utils.preprocessing import normalize_volume
 
-# --- TensorBoard viz helpers & optional deps ---
-import torch.nn.functional as F  # for image upscaling (viz only)
-try:
-    from torchvision.utils import make_grid  # optional; used for multi-slice grids
-except Exception:
-    make_grid = None
-
 amp_dtype = torch.bfloat16
 
 def set_seed(seed: int):
@@ -53,10 +46,6 @@ def load_config(config_path: str) -> dict:
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
-
-def is_cuda_oom(e: BaseException) -> bool:
-    msg = str(e).lower()
-    return isinstance(e, torch.cuda.OutOfMemoryError) or ("out of memory" in msg)
 
 
 def create_model(config: dict) -> nn.Module:
@@ -148,93 +137,30 @@ def create_scheduler(optimizer: optim.Optimizer, config: dict):
     return scheduler
 
 
-# ------------------------- BETTER TENSORBOARD HELPERS -------------------------
+# ------------------------- NEW: logging helpers -------------------------
 
-def _to_uint01(img: torch.Tensor) -> torch.Tensor:
-    """Min-max normalize per-image to [0,1]. Expects (N,1,H,W) or (1,H,W)."""
-    if img.ndim == 2:  # (H,W)
-        img = img.unsqueeze(0).unsqueeze(0)
-    elif img.ndim == 3:  # (1,H,W) or (C,H,W)
-        img = img.unsqueeze(0)
-    # img: (N,C,H,W)
-    mn = img.amin(dim=(2,3), keepdim=True)
-    mx = img.amax(dim=(2,3), keepdim=True)
-    img = (img - mn) / (mx - mn + 1e-8)
-    return img.squeeze(0)  # (C,H,W)
-
-def _slice_from_vol(vol_5d: torch.Tensor, plane: str = "axial", idx: "str|int" = "mid") -> torch.Tensor:
+def _add_images(writer, tag_prefix, fixed, moving, warped, step, max_images=4):
     """
-    vol_5d: (N=1,C=1,D,H,W) -> returns (H,W) slice tensor on CPU.
+    Log mid-slice previews (N,C,D,H,W or N,C,H,W supported). Normalizes to [0,1].
     """
-    v = vol_5d.detach().float().cpu()
-    assert v.ndim == 5 and v.shape[0] == 1 and v.shape[1] == 1
-    _, _, D, H, W = v.shape
-    if plane == "axial":   # z
-        k = D//2 if idx == "mid" else int(idx)
-        sl = v[0,0,k,:,:]
-    elif plane == "sag":   # x
-        k = W//2 if idx == "mid" else int(idx)
-        sl = v[0,0,:,:,k]
-    else:                  # "cor" y
-        k = H//2 if idx == "mid" else int(idx)
-        sl = v[0,0,:,k,:]
-    return sl  # (H,W)
-
-def _upscale_chw(chw: torch.Tensor, out_hw: int = 384) -> torch.Tensor:
-    """
-    CHW -> CHW upscaled (bilinear) for crisper TB display.
-    """
-    x = chw.unsqueeze(0)             # (1,C,H,W)
-    x = F.interpolate(x, size=(out_hw, out_hw), mode="bilinear", align_corners=False)
-    return x.squeeze(0)              # (C,H,W)
-
-def _add_images(writer, tag_prefix, fixed, moving, warped, step, *,
-                plane="axial", out_hw=384, grid_slices=0):
-    """
-    Logs mid-slice previews (normalized + upscaled). If grid_slices>0 and
-    torchvision is available, also logs a grid across the depth.
-    Accepts (N,C,D,H,W) or (N,C,H,W).
-    """
+    def _to_cpu_img(t):
+        t = t.detach().float().cpu()
+        if t.dim() == 5:  # N,C,D,H,W -> take middle depth slice
+            d = t.shape[2] // 2
+            t = t[:, :, d]  # N,C,H,W
+        # min-max per image
+        t = (t - t.amin(dim=(2,3), keepdim=True)) / (t.amax(dim=(2,3), keepdim=True) - t.amin(dim=(2,3), keepdim=True) + 1e-8)
+        return t
     try:
-        # Convert to (1,1,D,H,W) if needed and pick the first item
-        def _ensure_5d(x):
-            x = x.detach()
-            if x.ndim == 5:
-                return x[:1, :1]
-            elif x.ndim == 4:  # (N,C,H,W) -> treat as (N,C,1,H,W)
-                return x[:1, :1].unsqueeze(2)
-            else:
-                raise ValueError(f"Unexpected shape for image logging: {tuple(x.shape)}")
+        f = _to_cpu_img(fixed)[:max_images]
+        m = _to_cpu_img(moving)[:max_images]
+        w = _to_cpu_img(warped)[:max_images]
+        writer.add_images(f"{tag_prefix}/fixed",  f, step)
+        writer.add_images(f"{tag_prefix}/moving", m, step)
+        writer.add_images(f"{tag_prefix}/warped", w, step)
+    except Exception as _:
+        pass  # images are best-effort; don't crash training
 
-        f5 = _ensure_5d(fixed);  m5 = _ensure_5d(moving);  w5 = _ensure_5d(warped)
-
-        # Single mid-slice for paper figures
-        f_sl = _slice_from_vol(f5, plane=plane, idx="mid")
-        m_sl = _slice_from_vol(m5, plane=plane, idx="mid")
-        w_sl = _slice_from_vol(w5, plane=plane, idx="mid")
-
-        f_img = _upscale_chw(_to_uint01(f_sl), out_hw=out_hw)
-        m_img = _upscale_chw(_to_uint01(m_sl), out_hw=out_hw)
-        w_img = _upscale_chw(_to_uint01(w_sl), out_hw=out_hw)
-
-        writer.add_image(f"{tag_prefix}/{plane}/fixed",  f_img, step, dataformats="CHW")
-        writer.add_image(f"{tag_prefix}/{plane}/moving", m_img, step, dataformats="CHW")
-        writer.add_image(f"{tag_prefix}/{plane}/warped", w_img, step, dataformats="CHW")
-
-        # Optional: grid of evenly spaced slices (appendix-friendly)
-        if grid_slices and make_grid is not None:
-            _, _, D, _, _ = f5.shape
-            idxs = torch.linspace(0, D-1, steps=min(grid_slices, D)).long()
-            tiles = []
-            for k in idxs:
-                sl = _slice_from_vol(f5, plane=plane, idx=int(k))
-                sl = _to_uint01(sl)
-                sl = _upscale_chw(sl, out_hw=out_hw//2)  # slightly smaller tiles
-                tiles.append(sl)
-            grid = make_grid(torch.stack(tiles, 0), nrow=len(tiles), padding=2)  # (C,H,W)
-            writer.add_image(f"{tag_prefix}/{plane}/fixed_grid", grid, step, dataformats="CHW")
-    except Exception:
-        pass  # never let viz crash training
 
 def _log_param_and_grad_hists(writer, model, step, every_n=500):
     if step % every_n != 0:
@@ -250,6 +176,7 @@ def _log_param_and_grad_hists(writer, model, step, every_n=500):
             except Exception:
                 continue
 
+
 def _device_mem_stats():
     if not torch.cuda.is_available():
         return {}
@@ -260,114 +187,7 @@ def _device_mem_stats():
         'cuda/max_mem_allocated_mb': torch.cuda.max_memory_allocated(i) / (1024**2),
     }
 
-def _field_stats_and_hists(writer, tag_prefix, velocity_field, jacobian_det, step, *, hist_samples=250_000):
-    """
-    Logs flow magnitude stats and jacobian stats (+ histograms).
-    Purely for monitoring; no training effects.
-    """
-    try:
-        # Flow magnitude
-        if velocity_field is not None:
-            v = velocity_field.detach().float()
-            vmag = torch.linalg.vector_norm(v, dim=1)  # (N,D,H,W)
-            writer.add_scalar(f"{tag_prefix}/flow_mag_mean", vmag.mean().item(), step)
-            writer.add_scalar(f"{tag_prefix}/flow_mag_max",  vmag.max().item(), step)
-            # histogram (sample to keep TB light)
-            flat = vmag.flatten()
-            if flat.numel() > hist_samples:
-                idx = torch.randperm(flat.numel(), device=flat.device)[:hist_samples]
-                flat = flat[idx]
-            writer.add_histogram(f"{tag_prefix}/flow_mag_hist", flat.cpu().numpy(), step)
-
-        # Jacobian stats
-        if jacobian_det is not None:
-            j = jacobian_det.detach().float()
-            nonpos = (j <= 0).float().mean().item() * 100.0
-            writer.add_scalar(f"{tag_prefix}/jac_nonpos_percent", nonpos, step)
-            writer.add_scalar(f"{tag_prefix}/jac_min", j.min().item(), step)
-            writer.add_scalar(f"{tag_prefix}/jac_mean", j.mean().item(), step)
-            # histogram (sample)
-            flatj = j.flatten()
-            if flatj.numel() > hist_samples:
-                idx = torch.randperm(flatj.numel(), device=flatj.device)[:hist_samples]
-                flatj = flatj[idx]
-            writer.add_histogram(f"{tag_prefix}/jac_det_hist", flatj.cpu().numpy(), step)
-    except Exception:
-        pass
-
-# ---------------------------------------------------------------------------
-
-# ----------------------- GRACEFUL DATALOADER HELPERS ------------------------
-
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data._utils.collate import default_collate
-
-def is_cuda_oom(e: BaseException) -> bool:
-    msg = str(e).lower()
-    return isinstance(e, torch.cuda.OutOfMemoryError) or ("out of memory" in msg)
-
-class SafeDataset(Dataset):
-    """
-    Wraps another Dataset and returns None for samples that throw in __getitem__.
-    Keeps a set of bad indices to avoid repeating logs.
-    """
-    def __init__(self, base: Dataset, *, logger: SummaryWriter | None = None, split_name: str = "train"):
-        self.base = base
-        self.bad = set()
-        self.logger = logger
-        self.split = split_name
-
-    def __len__(self):
-        return len(self.base)
-
-    def __getitem__(self, idx):
-        try:
-            return self.base[idx]
-        except Exception as e:
-            # remember the index so we don't spam logs
-            if idx not in self.bad:
-                self.bad.add(idx)
-                print(f"[WARN] {self.split}: skipping bad sample idx={idx}: {e}")
-                if self.logger is not None:
-                    step = len(self.bad)
-                    self.logger.add_text(f"errors/{self.split}_sample", f"idx={idx} err={e}", step)
-                    self.logger.add_scalar(f"errors/{self.split}_bad_sample_count", len(self.bad), step)
-            return None
-
-def safe_collate(batch, *, min_batch: int = 1):
-    """
-    Drops None items produced by SafeDataset. Returns None if nothing left.
-    Uses default_collate for everything else.
-    """
-    batch = [b for b in batch if b is not None]
-    if len(batch) < min_batch:
-        return None
-    return default_collate(batch)
-
-def make_safe_loader(loader: DataLoader, *, split_name: str, logger: SummaryWriter, num_workers: int, pin_memory: bool = True) -> DataLoader:
-    """
-    Rebuild a DataLoader with SafeDataset + safe_collate. We keep the batch_size from the original loader
-    and sensible perf params.
-    """
-    base_ds = loader.dataset
-    safe_ds = SafeDataset(base_ds, logger=logger, split_name=split_name)
-
-    # train: shuffle, val: no shuffle
-    shuffle = (split_name == "train")
-
-    return DataLoader(
-        safe_ds,
-        batch_size=loader.batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=safe_collate,
-        drop_last=False,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
-        timeout=0
-    )
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 def train_epoch(
@@ -378,8 +198,7 @@ def train_epoch(
     scaler: GradScaler,
     config: dict,
     epoch: int,
-    writer: SummaryWriter,
-    fail_fast = False
+    writer: SummaryWriter
 ) -> dict:
     """Train for one epoch."""
     model.train()
@@ -388,36 +207,11 @@ def train_epoch(
     total_losses = {}
     num_batches = len(train_loader)
     
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
     start_time_epoch = time.time()
 
-    num_batches = len(train_loader)  # keep your existing variable
-    pbar = tqdm(total=num_batches, desc=f"Epoch {epoch}")
-    it = iter(train_loader)
-    batch_idx = 0
-    while batch_idx < num_batches:
+    for batch_idx, batch in enumerate(pbar):
         iter_start = time.time()
-        try:
-            batch = next(it)
-        except StopIteration:
-            break
-        except Exception as e:
-            if fail_fast:
-                raise
-            # fetching failed before forward — log and skip
-            print(f"[WARN] dataloader fetch failed at batch {batch_idx}: {e}")
-            writer.add_text("errors/dataloader_fetch",
-                            f"epoch={epoch} batch={batch_idx} err={e}",
-                            epoch * max(1, num_batches) + batch_idx)
-            batch_idx += 1
-            pbar.update(1)
-            continue
-
-        # SafeDataset+safe_collate may hand us None when all items were bad
-        if batch is None:
-            batch_idx += 1
-            pbar.update(1)
-            continue
-
         fixed = batch['fixed'].float()
         moving = batch['moving'].float()
         
@@ -468,80 +262,131 @@ def train_epoch(
             writer.add_text("errors/forward", f"epoch={epoch} batch={batch_idx} err={e}", epoch * num_batches + batch_idx)
             continue
         
-        # -------------------- Backward/Step with OOM guard --------------------
-        oom_this_batch = False
-        step = epoch * num_batches + batch_idx  # for logging
+        # # Backward pass
+        # if use_amp and hasattr(scaler, 'scale'):
+        #     try:
+        #         prev_scale = float(getattr(scaler, "get_scale", lambda: 1.0)())
+        #         scaler.scale(loss).backward()
+        #         scaler.unscale_(optimizer)
+                
+        #         # Gradient clipping
+        #         grad_norm = torch.nn.utils.clip_grad_norm_(
+        #             model.parameters(), 
+        #             config['training']['grad_clip_norm']
+        #         )
+                
+        #         # Check for NaN gradients
+        #         has_nan_grad = False
+        #         for name, param in model.named_parameters():
+        #             if param.grad is not None and torch.isnan(param.grad).any():
+        #                 has_nan_grad = True
+        #                 writer.add_text("warnings/nan_grad", f"epoch={epoch} batch={batch_idx} param={name}", epoch * num_batches + batch_idx)
+        #                 break
+                
+        #         if has_nan_grad:
+        #             continue
+                
+        #         scaler.step(optimizer)
+        #         scaler.update()
+        #         new_scale = float(getattr(scaler, "get_scale", lambda: 1.0)())
+        #     except ValueError as e:
+        #         if "Attempting to unscale FP16 gradients" in str(e):
+        #             # Fallback to non-AMP training for this batch
+        #             optimizer.zero_grad()
+        #             loss.backward()
+        #             grad_norm = torch.nn.utils.clip_grad_norm_(
+        #                 model.parameters(), 
+        #                 config['training']['grad_clip_norm']
+        #             )
+        #             optimizer.step()
+        #             new_scale = float(getattr(scaler, "get_scale", lambda: 1.0)())
+        #         else:
+        #             print(f"[ERROR] Exception in backward pass: {e}")
+        #             import traceback
+        #             traceback.print_exc()
+        #             writer.add_text("errors/backward", f"epoch={epoch} batch={batch_idx} err={e}", epoch * num_batches + batch_idx)
+        #             continue
+        #     except Exception as e:
+        #         print(f"[ERROR] Exception in backward pass: {e}")
+        #         import traceback
+        #         traceback.print_exc()
+        #         writer.add_text("errors/backward", f"epoch={epoch} batch={batch_idx} err={e}", epoch * num_batches + batch_idx)
+        #         continue
+        # else:
+        #     try:
+        #         loss.backward()
+                
+        #         grad_norm = torch.nn.utils.clip_grad_norm_(
+        #             model.parameters(), 
+        #             config['training']['grad_clip_norm']
+        #         )
+                
+        #         # Check for NaN gradients
+        #         has_nan_grad = False
+        #         for name, param in model.named_parameters():
+        #             if param.grad is not None and torch.isnan(param.grad).any():
+        #                 has_nan_grad = True
+        #                 writer.add_text("warnings/nan_grad", f"epoch={epoch} batch={batch_idx} param={name}", epoch * num_batches + batch_idx)
+        #                 break
+                
+        #         if has_nan_grad:
+        #             continue
+                
+        #         optimizer.step()
+        #         prev_scale = new_scale = 1.0
+        #     except Exception as e:
+        #         print(f"[ERROR] Exception in backward pass: {e}")
+        #         import traceback
+        #         traceback.print_exc()
+        #         writer.add_text("errors/backward", f"epoch={epoch} batch={batch_idx} err={e}", epoch * num_batches + batch_idx)
+        #         continue
 
-        try:
-            if hasattr(scaler, "is_enabled") and scaler.is_enabled():
-                prev_scale = float(getattr(scaler, "get_scale", lambda: 1.0)())
-                scaler.scale(loss).backward()
+        # Backward pass (robust AMP)
+        if hasattr(scaler, "is_enabled") and scaler.is_enabled():
+            prev_scale = float(getattr(scaler, "get_scale", lambda: 1.0)())
+            scaler.scale(loss).backward()
 
-                if config['training']['grad_clip_norm'] > 0.0:
-                    scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        config['training']['grad_clip_norm']
-                    )
-                else:
-                    grad_norm = float('nan')
-
-                # Optional NaN grad check
-                has_nan_grad = any(
-                    (p.grad is not None and torch.isnan(p.grad).any())
-                    for _, p in model.named_parameters()
+            if config['training']['grad_clip_norm'] > 0.0:
+                scaler.unscale_(optimizer)  # grads are FP32 here when scaler is enabled
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    config['training']['grad_clip_norm']
                 )
-
-                if has_nan_grad:
-                    optimizer.zero_grad(set_to_none=True)
-                    new_scale = float(getattr(scaler, "get_scale", lambda: 1.0)())
-                else:
-                    scaler.step(optimizer)
-                    scaler.update()
-                    new_scale = float(getattr(scaler, "get_scale", lambda: 1.0)())
             else:
-                loss.backward()
-                if config['training']['grad_clip_norm'] > 0.0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        config['training']['grad_clip_norm']
-                    )
-                else:
-                    grad_norm = float('nan')
+                grad_norm = float('nan')
 
-                has_nan_grad = any(
-                    (p.grad is not None and torch.isnan(p.grad).any())
-                    for _, p in model.named_parameters()
+            # Optional: quick NaN check (after unscale/clip)
+            has_nan_grad = any(
+                (p.grad is not None and torch.isnan(p.grad).any())
+                for _, p in model.named_parameters()
+            )
+            if has_nan_grad:
+                optimizer.zero_grad(set_to_none=True)
+                # skip step/update this batch
+                new_scale = float(getattr(scaler, "get_scale", lambda: 1.0)())
+            else:
+                scaler.step(optimizer)
+                scaler.update()
+                new_scale = float(getattr(scaler, "get_scale", lambda: 1.0)())
+        else:
+            loss.backward()
+            if config['training']['grad_clip_norm'] > 0.0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    config['training']['grad_clip_norm']
                 )
-                if not has_nan_grad:
-                    optimizer.step()
-                prev_scale = new_scale = 1.0
-
-        except RuntimeError as e:
-            if is_cuda_oom(e):
-                oom_this_batch = True
-                if fail_fast:
-                    raise
-                print(f"[WARN] OOM at epoch {epoch} batch {batch_idx}: {e}")
-                writer.add_scalar('errors/oom', 1, step)
-                writer.add_text('errors/oom_detail', f"epoch={epoch} batch={batch_idx} err={e}", step)
-
-                optimizer.zero_grad(set_to_none=True)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.reset_peak_memory_stats()
             else:
-                # non-OOM runtime error during backward/step
-                if fail_fast:
-                    raise
-                print(f"[WARN] RuntimeError (non-oom) at epoch {epoch} batch {batch_idx}: {e}")
-                writer.add_text('errors/backward_runtime', f"epoch={epoch} batch={batch_idx} err={e}", step)
-                optimizer.zero_grad(set_to_none=True)
+                grad_norm = float('nan')
 
-        if oom_this_batch:
-            # skip any per-batch success logging and move to next batch
-            continue
-        # ----------------------------------------------------------------------
+            # Optional: NaN check
+            has_nan_grad = any(
+                (p.grad is not None and torch.isnan(p.grad).any())
+                for _, p in model.named_parameters()
+            )
+            if not has_nan_grad:
+                optimizer.step()
+            prev_scale = new_scale = 1.0
+
 
         # Timing & throughput
         iter_time = time.time() - iter_start
@@ -582,22 +427,11 @@ def train_epoch(
             for k, v in _device_mem_stats().items():
                 writer.add_scalar(k, v, step)
 
-            # --- richer visualizations & stats ---
-            _add_images(writer, "train/images", fixed, moving, warped, step,
-                        plane="axial", out_hw=384, grid_slices=0)
-
-            _field_stats_and_hists(
-                writer, "train/fields",
-                velocity_field=velocity,
-                jacobian_det=jacobian_det,
-                step=step
-            )
+            # Example images (best-effort)
+            _add_images(writer, "train/images", fixed, moving, warped, step, max_images=2)
 
             # Param/grad histograms occasionally
             _log_param_and_grad_hists(writer, model, step, every_n=max(1, 10 * config['logging']['log_interval']))
-    
-        batch_idx += 1
-        pbar.update(1)
     
     epoch_time = time.time() - start_time_epoch
     writer.add_scalar('train/epoch_time_s', epoch_time, epoch)
@@ -616,8 +450,7 @@ def validate_epoch(
     criterion,
     config: dict,
     epoch: int,
-    writer: SummaryWriter,
-    fail_fast=False
+    writer: SummaryWriter
 ) -> dict:
     """Validate for one epoch."""
     model.eval()
@@ -627,31 +460,9 @@ def validate_epoch(
     num_batches = len(val_loader)
     
     with torch.no_grad():
-        num_batches = len(val_loader)
-        pbar = tqdm(total=num_batches, desc=f"Validation {epoch}")
-        it = iter(val_loader)
-        batch_idx = 0
-        while batch_idx < num_batches:
-            try:
-                batch = next(it)
-            except StopIteration:
-                break
-            except Exception as e:
-                if fail_fast:
-                    raise
-                print(f"[WARN] val dataloader fetch failed at batch {batch_idx}: {e}")
-                writer.add_text("errors/val_dataloader_fetch",
-                                f"epoch={epoch} batch={batch_idx} err={e}",
-                                epoch * max(1, num_batches) + batch_idx)
-                batch_idx += 1
-                pbar.update(1)
-                continue
-
-            if batch is None:
-                batch_idx += 1
-                pbar.update(1)
-                continue
-
+        pbar = tqdm(val_loader, desc=f"Validation {epoch}")
+        
+        for batch_idx, batch in enumerate(pbar):
             fixed = batch['fixed'].float()
             moving = batch['moving'].float()
             
@@ -687,9 +498,11 @@ def validate_epoch(
                     mseg = batch['segmentation_moving'].to(device, non_blocking=True).long()
 
                     # Binary foreground Dice (quick + robust)
+                    # Treat label > 0 as foreground; great for monitoring even if class sets differ.
                     ffg = (fseg > 0).float()
                     mfg = (mseg > 0).float()
 
+                    # Warp moving foreground via probability (one-hot) to avoid NN requirement
                     # Make 2-class one-hot [bg, fg]
                     m2 = torch.cat([(1.0 - mfg), mfg], dim=1)  # (N,2,D,H,W)
 
@@ -724,21 +537,11 @@ def validate_epoch(
             
             pbar.set_postfix({'val_loss': f"{loss.item():.4f}"})
 
-            # Per-batch val logging
+            # Per-batch val logging (optional but useful for long epochs)
             if batch_idx % max(1, config['logging']['log_interval']) == 0:
                 step = epoch * num_batches + batch_idx
                 writer.add_scalar('val/step_loss', loss.item(), step)
-                _add_images(writer, "val/images", fixed, moving, warped, step,
-                            plane="axial", out_hw=384, grid_slices=0)
-                _field_stats_and_hists(
-                    writer, "val/fields",
-                    velocity_field=velocity,
-                    jacobian_det=jacobian_det,
-                    step=step
-                )
-                
-            batch_idx += 1
-            pbar.update(1)
+                _add_images(writer, "val/images", fixed, moving, warped, step, max_images=2)
     
     # Average losses
     avg_losses = {key: value / num_batches for key, value in total_losses.items()} if num_batches > 0 else {}
@@ -749,18 +552,6 @@ def validate_epoch(
     for key, value in avg_losses.items():
         if key != 'avg_loss':
             writer.add_scalar(f'val/{key}', value, epoch)
-
-    # --- one full-slice-style preview from the last seen batch (best-effort) ---
-    try:
-        writer.add_text('val/preview_note', 'Preview uses first item of a validation batch', epoch)
-        _add_images(writer, "val/preview_fullslice_like", fixed[:1], moving[:1], warped[:1],
-                    step=epoch, plane="axial", out_hw=512, grid_slices=0)
-        _add_images(writer, "val/preview_fullslice_like", fixed[:1], moving[:1], warped[:1],
-                    step=epoch, plane="sag", out_hw=512, grid_slices=0)
-        _add_images(writer, "val/preview_fullslice_like", fixed[:1], moving[:1], warped[:1],
-                    step=epoch, plane="cor", out_hw=512, grid_slices=0)
-    except Exception:
-        pass
     
     return avg_losses
 
@@ -845,19 +636,12 @@ def main():
     parser.add_argument('--seed', type=int, help='Override random seed')
     parser.add_argument('--resume', type=str, default=None,
                     help='Path to a checkpoint to resume from')
-    # add with the other flags
-    parser.add_argument('--fail_fast', action='store_true',
-                    help='Abort immediately on any batch/data error (default: skip bad batches)')
-
 
 
     args = parser.parse_args()
     
     # Load configuration
     config = load_config(args.config)
-    
-    # Fail fast
-    FAIL_FAST = bool(args.fail_fast)
     
     # Override seed if provided
     if args.seed is not None:
@@ -1005,12 +789,6 @@ def main():
     print(f"Val batches: {len(val_loader)}")
     writer.add_scalar('data/train_batches', len(train_loader), 0)
     writer.add_scalar('data/val_batches', len(val_loader), 0)
-
-    if not FAIL_FAST:
-        train_loader = make_safe_loader(train_loader, split_name="train", logger=writer,
-                                        num_workers=config['data']['num_workers'])
-        val_loader   = make_safe_loader(val_loader,   split_name="val",   logger=writer,
-                                        num_workers=config['data']['num_workers'])
     
     # Create model
     model = create_model(config)
@@ -1076,11 +854,14 @@ def main():
     # Mixed precision scaler
     if config['training']['use_amp'] and device.type == 'cuda':
         # Try new API first
+        # Mixed precision scaler
         try:
-            from torch.amp import GradScaler as AmpGradScaler
+            from torch.amp import GradScaler
         except Exception:
-            from torch.cuda.amp import GradScaler as AmpGradScaler
-        scaler = AmpGradScaler(device="cuda", enabled=(use_amp and amp_dtype is torch.float16))
+            from torch.cuda.amp import GradScaler
+
+        scaler = GradScaler(device="cuda",enabled=(use_amp and amp_dtype is torch.float16))
+
     else:
         # For CPU or when AMP is disabled, create a dummy scaler
         class DummyScaler:
@@ -1089,7 +870,6 @@ def main():
             def update(self): pass
             def unscale_(self, optimizer): pass
             def get_scale(self): return 1.0
-            def is_enabled(self): return False
         scaler = DummyScaler()
     
     # Training loop
@@ -1116,7 +896,7 @@ def main():
         
         # Train
         train_losses = train_epoch(
-            model, train_loader, criterion, optimizer, scaler, config, epoch, writer,FAIL_FAST
+            model, train_loader, criterion, optimizer, scaler, config, epoch, writer
         )
         
         print(f"Train Loss: {train_losses['avg_loss']:.4f}")
@@ -1129,7 +909,7 @@ def main():
         # Validate
         if epoch % config['validation']['eval_interval'] == 0:
             val_losses = validate_epoch(
-                model, val_loader, criterion, config, epoch, writer,FAIL_FAST
+                model, val_loader, criterion, config, epoch, writer
             )
             
             print(f"Val Loss: {val_losses['avg_loss']:.4f}")

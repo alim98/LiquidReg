@@ -48,32 +48,25 @@ def save_nifti_volume(
     nib.save(nii, filepath)
 
 
-def load_model(checkpoint_path: str, device: torch.device) -> LiquidReg:
-    """Load trained model from checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Get model configuration from checkpoint
-    config = checkpoint['config']
-    model_config = config['model']
-    
-    # Create model
-    model = LiquidReg(
-        image_size=tuple(model_config['image_size']),
-        encoder_type=model_config['encoder_type'],
-        encoder_channels=model_config['encoder_channels'],
-        liquid_hidden_dim=model_config['liquid_hidden_dim'],
-        liquid_num_steps=model_config['liquid_num_steps'],
-        velocity_scale=model_config['velocity_scale'],
-        num_squaring=model_config['num_squaring'],
-        fusion_type=model_config['fusion_type'],
-    )
-    
-    # Load weights
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
+# scripts/inference.py
+
+from scripts.train import create_model
+
+def load_model(checkpoint_path: str, device: torch.device):
+    """Load trained model from checkpoint, reconstructing the exact architecture."""
+    ckpt = torch.load(checkpoint_path, map_location=device)
+
+    cfg = ckpt.get('config', None)
+    if cfg is None:
+        raise RuntimeError(f"Checkpoint {checkpoint_path} has no 'config'.")
+
+    # Build the exact model used in training
+    model = create_model(cfg).to(device=device, dtype=torch.float32)
     model.eval()
-    
-    return model
+
+    # Strict load to catch any mismatch early
+    model.load_state_dict(ckpt['model_state_dict'], strict=True)
+    return model, cfg
 
 
 def preprocess_volume(
@@ -81,11 +74,11 @@ def preprocess_volume(
     target_size: tuple = (128, 128, 128)
 ) -> torch.Tensor:
     """Preprocess volume for inference."""
+    # Resize to target size
+    volume = resample_volume(volume, target_size, mode="trilinear")
     # Normalize
     volume = normalize_volume(volume, method="zscore")
     
-    # Resize to target size
-    volume = resample_volume(volume, target_size, mode="trilinear")
     
     return volume
 
@@ -121,7 +114,8 @@ def register_images(
     
     # Load model
     print("Loading model...")
-    model = load_model(model_path, device)
+    model, cfg = load_model(model_path, device)
+    target_size = tuple(cfg["model"]["image_size"])
     
     # Perform registration
     print("Performing registration...")

@@ -43,6 +43,42 @@ def normalize_volume(volume: torch.Tensor, method: str = "zscore") -> torch.Tens
     return normalized
 
 
+# def resample_volume(
+#     volume: torch.Tensor,
+#     target_shape: Tuple[int, int, int],
+#     mode: str = "trilinear"
+# ) -> torch.Tensor:
+#     """
+#     Resample a volume to target shape.
+    
+#     Args:
+#         volume: Input volume (B, C, D, H, W) or (C, D, H, W)
+#         target_shape: Target spatial shape (D, H, W)
+#         mode: Interpolation mode
+        
+#     Returns:
+#         resampled: Resampled volume
+#     """
+#     if volume.dim() == 4:
+#         volume = volume.unsqueeze(0)
+#         squeeze_batch = True
+#     else:
+#         squeeze_batch = False
+    
+#     resampled = F.interpolate(
+#         volume,
+#         size=target_shape,
+#         mode=mode,
+#         align_corners=False
+#     )
+    
+#     if squeeze_batch:
+#         resampled = resampled.squeeze(0)
+    
+#     return resampled
+
+# utils/preprocessing.py
+
 def resample_volume(
     volume: torch.Tensor,
     target_shape: Tuple[int, int, int],
@@ -50,31 +86,27 @@ def resample_volume(
 ) -> torch.Tensor:
     """
     Resample a volume to target shape.
-    
+
     Args:
-        volume: Input volume (B, C, D, H, W) or (C, D, H, W)
-        target_shape: Target spatial shape (D, H, W)
-        mode: Interpolation mode
-        
-    Returns:
-        resampled: Resampled volume
+        volume: (B, C, D, H, W) or (C, D, H, W)
+        target_shape: (D, H, W)
+        mode: 'trilinear' for images, 'nearest' for labels, etc.
     """
-    if volume.dim() == 4:
-        volume = volume.unsqueeze(0)
+    # Ensure 5D input for interpolate
+    squeeze_batch = False
+    if volume.dim() == 4:                 # (C, D, H, W)
+        volume = volume.unsqueeze(0)      # -> (1, C, D, H, W)
         squeeze_batch = True
-    else:
-        squeeze_batch = False
-    
-    resampled = F.interpolate(
-        volume,
-        size=target_shape,
-        mode=mode,
-        align_corners=False
-    )
-    
+
+    kwargs = dict(size=target_shape, mode=mode)
+    # Only set align_corners for linear family modes
+    if mode in {"linear", "bilinear", "bicubic", "trilinear"}:
+        kwargs["align_corners"] = False
+
+    resampled = F.interpolate(volume, **kwargs)
+
     if squeeze_batch:
-        resampled = resampled.squeeze(0)
-    
+        resampled = resampled.squeeze(0)  # back to (C, D, H, W)
     return resampled
 
 

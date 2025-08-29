@@ -79,42 +79,59 @@ class L2RTask3Dataset(Dataset):
 
     
     def _discover_volumes(self) -> List[dict]:
-        volumes = []
-        if self.split == "train":
-            for subj_dir in sorted(self.data_dir.glob("OASIS_OAS1_*_MR1")):
-                try:
-                    sid = int(subj_dir.name.split("_")[2])
-                except (IndexError, ValueError):
-                    continue
+        volumes: List[dict] = []
 
-                img = subj_dir / "aligned_norm.nii.gz"
-                if not img.exists():
-                    nii_files = list(subj_dir.glob("*.nii.gz"))
-                    img = nii_files[0] if nii_files else None
+        def add_oasis_subject(subj_dir: Path) -> None:
+            # subj_dir: .../OASIS_OAS1_####_MR1
+            try:
+                sid = int(subj_dir.name.split("_")[2])  # '0001' -> 1
+            except (IndexError, ValueError):
+                return
 
+            # prefer aligned_norm.nii.gz, else first *.nii*
+            img = subj_dir / "aligned_norm.nii.gz"
+            if not img.exists():
+                nii_files = sorted(subj_dir.glob("*.nii*"))
+                if not nii_files:
+                    return  # skip subjects with no image
+                img = nii_files[0]
+
+            label = None
+            if self.use_labels:
                 label = subj_dir / "aligned_seg35.nii.gz"
-                if self.use_labels and not label.exists():
-                    seg_files = list(subj_dir.glob("seg*.nii.gz"))
+                if not label.exists():
+                    seg_files = sorted(subj_dir.glob("seg*.nii*"))
                     label = seg_files[0] if seg_files else None
 
-                volumes.append({"id": sid, "image": img, "label": label})
+            volumes.append({"id": sid, "image": img, "label": label})
+
+        if self.split == "train":
+            for subj_dir in sorted(self.data_dir.glob("OASIS_OAS1_*_MR1")):
+                add_oasis_subject(subj_dir)
+
         elif self.split in {"val", "test"}:
-            for img_path in sorted(self.data_dir.glob("img*.nii.gz")):
-                # img_path is '.../imgXXXX.nii.gz'.  Path.stem on a double
-                # extension returns 'imgXXXX.nii', so we need to strip the
-                # optional '.nii' as well before casting to int.
-                try:
-                    sid_str = img_path.stem  # 'img0438.nii'
-                    sid_str = sid_str.replace("img", "")  # '0438.nii'
+            # Prefer OASIS-style folders if present...
+            subj_dirs = sorted(self.data_dir.glob("OASIS_OAS1_*_MR1"))
+            if subj_dirs:
+                for subj_dir in subj_dirs:
+                    add_oasis_subject(subj_dir)
+            else:
+                # ...otherwise fall back to L2R-style flat files (img*.nii.gz)
+                for img_path in sorted(self.data_dir.glob("img*.nii.gz")):
+                    # Path.stem for .nii.gz -> 'img0438.nii' -> strip '.nii'
+                    sid_str = img_path.stem.replace("img", "")
                     if sid_str.endswith(".nii"):
-                        sid_str = sid_str[:-4]  # drop '.nii'
-                    sid = int(sid_str)
-                except ValueError:
-                    # Skip files with unexpected names
-                    continue
-                label_path = self.data_dir / f"seg{sid:04d}.nii.gz"
-                label = label_path if label_path.exists() else None
-                volumes.append({"id": sid, "image": img_path, "label": label})
+                        sid_str = sid_str[:-4]
+                    try:
+                        sid = int(sid_str)
+                    except ValueError:
+                        continue
+                    label = None
+                    if self.use_labels:
+                        lp = self.data_dir / f"seg{sid:04d}.nii.gz"
+                        label = lp if lp.exists() else None
+                    volumes.append({"id": sid, "image": img_path, "label": label})
+
         else:
             raise ValueError(f"Unknown split: {self.split}")
 
@@ -371,7 +388,11 @@ def create_oasis_loaders(
 
     root = Path(data_root)
     train_dir = root / "L2R_2021_Task3_train"
-    val_dir = root / "L2R_2021_Task3_val"
+    # val_dir = root / "L2R_2021_Task3_val"
+
+    train_dir = root / "OASIS_train"
+    val_dir   = root / "OASIS_val"
+
 
     if not train_dir.exists():
         raise FileNotFoundError(f"Expected train directory {train_dir} not found.")
