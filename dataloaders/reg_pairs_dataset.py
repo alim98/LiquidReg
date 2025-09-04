@@ -80,24 +80,60 @@ class RegPairsDataset(Dataset):
         np.random.seed(seed)
 
         self.augmentor = PatchAugmentor() if self.augment else None
+        
+        from collections import OrderedDict
+        self._cache = OrderedDict()   # key -> np.ndarray
+        self._cache_max = 32          # tune to your RAM
+
 
     def __len__(self) -> int:
         return len(self.rows) * self.patches_per_pair
 
     def _load_volume(self, path: str, is_label: bool = False) -> Optional[np.ndarray]:
-        """Load a NIfTI volume fully into memory."""
+        """Load a NIfTI and (optionally) resample once, then cache the result."""
         if not path or not os.path.exists(path):
             return None
-        arr = nib.load(str(path)).get_fdata()
-        
-        if self.target_size is not None:
-            t = torch.from_numpy(arr)[None, None]  # (1,1,D,H,W)
-            mode = self.resample_mode_lbl if is_label else self.resample_mode_img
-            # print("DBG", "is_label", is_label, "mode", mode, "shape", t.shape)
-            t = resample_volume(t.float(), self.target_size, mode=mode)
-            arr = t.squeeze(0).squeeze(0).cpu().numpy()
-        
-        return arr.astype(np.int32 if is_label else np.float32)
+        target = tuple(self.target_size) if self.target_size else None
+        mode = "nearest" if is_label else "trilinear"
+        key = (path, bool(is_label), target, mode)
+        # return cached resampled
+        if key in self._cache:
+            arr = self._cache.pop(key)
+            self._cache[key] = arr
+            return arr
+        # load raw (cache raw too to avoid gz decode repeatedly)
+        raw_key = ("RAW", path)
+        if raw_key in self._cache:
+            raw = self._cache.pop(raw_key); self._cache[raw_key] = raw
+        else:
+            nii = nib.load(str(path))
+            raw = nii.get_fdata()
+            # store spacings (sz, sy, sx) on the side for this path
+            try:
+                zooms = tuple(map(float, nii.header.get_zooms()[:3]))
+            except Exception:
+                zooms = (1.0, 1.0, 1.0)
+            self._cache[("SPACING", path)] = zooms
+            raw = raw.astype(np.int32 if is_label else np.float32)
+            self._cache[raw_key] = raw
+            if len(self._cache) > self._cache_max:
+                self._cache.popitem(last=False)
+        arr = raw
+        if target is not None:
+            t = torch.from_numpy(arr)[None, None]
+            arr = resample_volume(t.float(), target, mode=mode).squeeze().cpu().numpy()
+            arr = arr.astype(np.int32 if is_label else np.float32)
+            # update spacing: physical size preserved ⇒ spacing scales with shape
+            old_shape = raw.shape[:3]
+            sz, sy, sx = self._cache.get(("SPACING", path), (1.0, 1.0, 1.0))
+            oz, oh, ow = old_shape
+            nz, nh, nw = target
+            new_spacing = (sz * oz / nz, sy * oh / nh, sx * ow / nw)
+            self._cache[("SPACING", path)] = new_spacing
+        self._cache[key] = arr
+        if len(self._cache) > self._cache_max:
+            self._cache.popitem(last=False)
+        return arr
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row_idx = idx // self.patches_per_pair
@@ -114,6 +150,9 @@ class RegPairsDataset(Dataset):
         # Convert to torch tensors (C,D,H,W)
         fixed = torch.from_numpy(f_img).unsqueeze(0).float()
         moving = torch.from_numpy(m_img).unsqueeze(0).float()
+        # spacing tensors (sz, sy, sx)
+        f_spacing = torch.tensor(self._cache.get(("SPACING", f_path), (1.0, 1.0, 1.0)), dtype=torch.float32)
+        m_spacing = torch.tensor(self._cache.get(("SPACING", m_path), (1.0, 1.0, 1.0)), dtype=torch.float32)
 
         # Normalize
         fixed = normalize_volume(fixed)
@@ -155,14 +194,17 @@ class RegPairsDataset(Dataset):
             "fixed": fixed_patch,   # (1, S, S, S)
             "moving": moving_patch, # (1, S, S, S)
             "pair_index": row_idx,
+            # use fixed spacing as the reference grid for loss/metrics
+            "spacing": f_spacing,  # (sz, sy, sx) in mm/voxel
         }
 
         # Augmentation (synchronized for both)
+        # Augmentation (synchronized for both): seed ALL RNGs: random, numpy, torch
         if self.augment and self.augmentor is not None:
             seed = torch.randint(0, 1_000_000, (1,)).item()
-            torch.manual_seed(seed)
+            random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
             out["fixed"] = self.augmentor.augment(fixed_patch)
-            torch.manual_seed(seed)
+            random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
             out["moving"] = self.augmentor.augment(moving_patch)
 
         # Optional segmentation
@@ -242,3 +284,65 @@ def create_loaders_from_pairs(
         )
 
     return train_loader, val_loader, test_loader
+
+# --- DDP-aware DataLoader builder for RegPairsDataset ---
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+def create_reg_pairs_loaders_ddp(
+    train_pairs_csv: str,
+    val_pairs_csv: str,
+    *,
+    batch_size: int,
+    patch_size: int,
+    patch_stride: int,
+    patches_per_pair: int,
+    num_workers: int,
+    use_labels_train: bool = True,
+    use_labels_val: bool = True,
+    target_size=None,
+    distributed: bool = False,
+):
+    train_ds = RegPairsDataset(
+        train_pairs_csv,
+        patch_size=patch_size,
+        patch_stride=patch_stride,
+        patches_per_pair=patches_per_pair,
+        augment=True,
+        use_labels=use_labels_train,
+        target_size=target_size,
+    )
+    val_ds = RegPairsDataset(
+        val_pairs_csv,
+        patch_size=patch_size,
+        patch_stride=patch_stride,
+        patches_per_pair=patches_per_pair,
+        augment=False,
+        use_labels=use_labels_val,
+        target_size=target_size,
+    )
+
+    train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True) if distributed else None
+    val_sampler   = DistributedSampler(val_ds,   shuffle=False, drop_last=False) if distributed else None
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=(num_workers > 0),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=(num_workers > 0),
+    )
+    return train_loader, val_loader, train_sampler, val_sampler

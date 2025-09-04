@@ -214,6 +214,20 @@ def main() -> int:
     if not pairs:
         print("ERROR: no pairs produced.", file=sys.stderr)
         return 2
+    
+    seen = set()
+    uniq = []
+    for a, b in pairs:
+        # canonical key based on the *image* path strings
+        ka = str(a["img"])
+        kb = str(b["img"])
+        key = (ka, kb) if ka < kb else (kb, ka)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((a, b))
+    pairs = uniq
+
 
     # apply max_pairs restriction
     if args.max_pairs is not None and len(pairs) > args.max_pairs:

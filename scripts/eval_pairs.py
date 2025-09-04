@@ -29,6 +29,7 @@ sys.path.append(str(REPO))
 from scripts.inference import load_model, load_nifti_volume, preprocess_volume, save_nifti_volume
 from models.scaling_squaring import SpatialTransformer
 from utils.preprocessing import resample_volume
+from models.scaling_squaring import compute_jacobian_determinant
 
 
 # ------------------------- Metrics helpers -------------------------
@@ -157,9 +158,23 @@ def main():
             out = model(fixed_pre, moving_pre, return_intermediate=True)
         elapsed = time.time() - start
 
-        warped = out["warped_moving"]           # (1,1,D,H,W)
-        flow   = out["deformation_field"]       # (1,3,D,H,W)
-        jac    = out.get("jacobian_det", None)  # (1,D,H,W) if present
+        warped = out["warped_moving"]     # (1,1,D,H,W)
+        flow   = out["deformation_field"] # (1,3,D,H,W)
+
+        # --- spacing of the EVAL GRID (use FIXED image as reference) ---
+        # original NIfTI zooms are (sz, sy, sx) for the *original* fixed volume
+        f_sz, f_sy, f_sx = tuple(map(float, fixed_hdr.get_zooms()[:3]))
+        oz, oh, ow = fixed_vol.shape[:3]
+        nz, nh, nw = model_img_size  # you resampled to this size before inference
+        # preserve physical size ⇒ spacing scales with shape change
+        sz = f_sz * oz / nz
+        sy = f_sy * oh / nh
+        sx = f_sx * ow / nw
+        spacing = flow.new_tensor((sz, sy, sx))
+
+        # spacing-aware Jacobian on the resampled eval grid
+        jac = compute_jacobian_determinant(flow, spacing)  # (1,1,D-2,H-2,W-2)
+        fold_pct = float((jac <= 0).float().mean().item() * 100.0)
 
         # Metrics
         ncc = ncc_metric(fixed_pre, warped)
@@ -167,8 +182,6 @@ def main():
         f = fixed_pre.squeeze().cpu().numpy()   # (D,H,W)
         w = warped.squeeze().cpu().numpy()      # (D,H,W)
         ssim_val = ssim_volume_mean(f, w) if not args.no_ssim else np.nan
-
-        fold_pct = float(torch.mean((jac <= 0).float()).item() * 100.0) if (jac is not None) else np.nan
 
         # Dice/HD95 only for OASIS (has labels)
         fseg_path, mseg_path = row.get("fixed_seg"), row.get("moving_seg")
@@ -211,8 +224,9 @@ def main():
             flow_cpu = flow.cpu()
             for c, name in enumerate(["dx","dy","dz"]):
                 save_nifti_volume(flow_cpu[:, c:c+1], str(pair_out / f"flow_{name}.nii.gz"), moving_aff, moving_hdr)
-        if not args.no_save_jacobian and jac is not None:
-            save_nifti_volume(jac.cpu(), str(pair_out / "jacobian_det.nii.gz"), moving_aff, moving_hdr)
+        if not args.no_save_jacobian:
+            # jac is (B,1,D-2,H-2,W-2); save as-is in the fixed-image space
+            save_nifti_volume(jac.cpu(), str(pair_out / "jacobian_det.nii.gz"), fixed_aff, fixed_hdr)
 
         results_rows.append({
             "idx": i,

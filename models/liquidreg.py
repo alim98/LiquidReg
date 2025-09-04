@@ -149,7 +149,16 @@ class LiquidReg(nn.Module):
         velocity_field = self.liquid_core(coord_grid, liquid_params)
         
         # Compute deformation field via scaling & squaring
-        deformation_field = self.scaling_squaring(velocity_field)
+        # Convert normalized velocity to voxel units before S&S
+        B, _, D, H, W = fixed.shape  # fixed: [B,1,D,H,W]
+        v = velocity_field
+        v_vox = torch.empty_like(v)
+        v_vox[:, 0] = v[:, 0] * (W / 2.0)  # x uses width
+        v_vox[:, 1] = v[:, 1] * (H / 2.0)  # y uses height
+        v_vox[:, 2] = v[:, 2] * (D / 2.0)  # z uses depth
+
+        deformation_field = self.scaling_squaring(v_vox)
+
         
         # Warp moving image
         warped_moving = self.spatial_transformer(moving, deformation_field)
@@ -162,8 +171,25 @@ class LiquidReg(nn.Module):
         }
         
         if return_intermediate:
-            from .scaling_squaring import compute_jacobian_determinant
+            from .scaling_squaring import (
+                compute_jacobian_determinant,
+                compute_jacobian_determinant_raw,
+                foldings_percent,
+            )
+
+            # clamped version — keep for loss
             jacobian_det = compute_jacobian_determinant(deformation_field)
+            
+            output["jacobian_det"] = jacobian_det
+
+            # unclamped version — for logging only
+            with torch.no_grad():
+                jacobian_det_raw = compute_jacobian_determinant_raw(deformation_field)
+                output["jacobian_det_raw"] = jacobian_det_raw
+                # both overall scalar and per-sample vector are handy:
+                output["foldings_pct_raw"] = foldings_percent(jacobian_det_raw, per_sample=False)
+                output["foldings_pct_raw_per_sample"] = foldings_percent(jacobian_det_raw, per_sample=True)
+
             output["jacobian_det"] = jacobian_det
             output["features_fixed"] = feat_fixed
             output["features_moving"] = feat_moving
@@ -304,7 +330,16 @@ class LiquidRegLite(nn.Module):
         
         # Generate velocity and deformation fields
         velocity_field = self.liquid_core(coord_grid, liquid_params)
-        deformation_field = self.scaling_squaring(velocity_field)
+        # Convert normalized velocity to voxel units before S&S
+        B, _, D, H, W = fixed.shape  # fixed: [B,1,D,H,W]
+        v = velocity_field
+        v_vox = torch.empty_like(v)
+        v_vox[:, 0] = v[:, 0] * (W / 2.0)  # x uses width
+        v_vox[:, 1] = v[:, 1] * (H / 2.0)  # y uses height
+        v_vox[:, 2] = v[:, 2] * (D / 2.0)  # z uses depth
+
+        deformation_field = self.scaling_squaring(v_vox)
+
         
         # Warp image
         warped_moving = self.spatial_transformer(moving, deformation_field)
@@ -318,6 +353,7 @@ class LiquidRegLite(nn.Module):
         if return_intermediate and B > 0:
             from .scaling_squaring import compute_jacobian_determinant
             jacobian_det = compute_jacobian_determinant(deformation_field)
+            
             output["jacobian_det"] = jacobian_det
             output["features_fixed"] = feat_fixed
             output["features_moving"] = feat_moving

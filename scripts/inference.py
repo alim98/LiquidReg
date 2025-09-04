@@ -132,8 +132,13 @@ def register_images(
     deformation_resized = resample_volume(deformation_field, original_size, mode="trilinear")
     
     # Scale deformation field
-    for i in range(3):
-        deformation_resized[:, i] *= original_size[i] / target_size[i]
+    # Map (D,H,W) to (x,y,z) = (W,H,D)
+    scale_x = original_size[2] / target_size[2]  # W
+    scale_y = original_size[1] / target_size[1]  # H
+    scale_z = original_size[0] / target_size[0]  # D
+    deformation_resized[:, 0] *= scale_x  # x
+    deformation_resized[:, 1] *= scale_y  # y
+    deformation_resized[:, 2] *= scale_z  # z
     
     # Create output directory
     output_path = Path(output_dir)

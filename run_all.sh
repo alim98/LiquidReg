@@ -14,15 +14,17 @@ PAIRS_K=5                     # partners per subject in each CSV
 PAIRS_SEED=123                # deterministic sampling for pairs
 CONFIG_LIST_FILE="configs/cfgs_to_run.txt"  # optional list of configs to run
 REMAKE_PAIRS=0
-# MAX_PAIRS_OASIS_TEST=100
-# MAX_PAIRS_OASIS_TRAIN=1000
-# MAX_PAIRS_OASIS_VAL=100
-# MAX_PAIRS_IXI=100
-MAX_PAIRS_OASIS_TEST=2
-MAX_PAIRS_OASIS_TRAIN=5
-MAX_PAIRS_OASIS_VAL=2
-MAX_PAIRS_IXI=2
-MAX_PAIRS_L2R=2
+
+MAX_PAIRS_OASIS_TEST=100
+MAX_PAIRS_OASIS_TRAIN=1000
+MAX_PAIRS_OASIS_VAL=100
+MAX_PAIRS_IXI=100
+MAX_PAIRS_L2R=100
+# MAX_PAIRS_OASIS_TEST=2
+# MAX_PAIRS_OASIS_TRAIN=5
+# MAX_PAIRS_OASIS_VAL=2
+# MAX_PAIRS_IXI=2
+# MAX_PAIRS_L2R=2
 RESUME_FROM_CHECKPOINT=0  # 0/1: resume from best available checkpoint in work dir
 
 # data layout (produced by setup_data.sh)
@@ -35,7 +37,7 @@ IXI_DIR="data/gen_IXI_eval"   # created by setup_data.sh
 # Setup
 ENV_NAME="LiquidReg_env"
 PYTHON_VERSION="3.12.11"
-SKIP_SETUP=${SKIP_SETUP:-1}   # set SKIP_SETUP=1 to skip conda/pip setup
+SKIP_SETUP=${SKIP_SETUP:-0}   # set SKIP_SETUP=1 to skip conda/pip setup
 
 # ---- helpers ----
 log(){ echo "[$(date +'%H:%M:%S')] $*"; }
@@ -169,12 +171,28 @@ else
   log "train.py does NOT expose --train_pairs/--val_pairs (falling back to legacy loader)"
 fi
 
+# ---- Choose launcher (python vs torchrun) ----
+NUM_GPUS=$(python - <<'PY'
+import torch
+print(torch.cuda.device_count() if torch.cuda.is_available() else 0)
+PY
+)
+
+if [ "${NUM_GPUS}" -ge 2 ]; then
+  log "[DDP] ${NUM_GPUS} GPUs detected -> using torchrun"
+  LAUNCHER="torchrun --standalone --nproc_per_node=${NUM_GPUS}"
+  DDP_FLAG="--ddp"
+else
+  log "[DDP] ${NUM_GPUS} GPU(s) detected -> using python"
+  LAUNCHER="python -u"
+  DDP_FLAG=""
+fi
+
 # ---- 4) Define how to train/infer ----
 TRAIN_CMD(){ # args: config workdir seed
   local cfg="$1" work="$2" seed="$3"
   local resume_args=()
   if (( RESUME_FROM_CHECKPOINT )); then
-    # choose the most recent ckpt under $work if present
     local ckpt
     ckpt=$(FIND_BEST_CKPT "$work" || true)
     if [[ -n "${ckpt:-}" && -f "$ckpt" ]]; then
@@ -183,21 +201,24 @@ TRAIN_CMD(){ # args: config workdir seed
   fi
 
   if (( USE_PAIRS )); then
-    python -u scripts/train.py \
+    ${LAUNCHER} scripts/train.py \
       --config "$cfg" \
       --train_pairs "$OASIS_TRAIN/pairs_train.csv" \
       --val_pairs   "$OASIS_VAL/pairs_val.csv" \
       --work_dir "$work" \
       --seed "$seed" \
+      ${DDP_FLAG} \
       "${resume_args[@]}"
   else
-    python -u scripts/train.py \
+    ${LAUNCHER} scripts/train.py \
       --config "$cfg" \
       --work_dir "$work" \
       --seed "$seed" \
+      ${DDP_FLAG} \
       "${resume_args[@]}"
   fi
 }
+
 
 INFER_ON_PAIRS(){ # args: config ckpt pairs outdir
   local cfg="$1" ckpt="$2" pairs="$3" out="$4"

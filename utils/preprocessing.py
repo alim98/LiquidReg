@@ -99,9 +99,8 @@ def resample_volume(
         squeeze_batch = True
 
     kwargs = dict(size=target_shape, mode=mode)
-    # Only set align_corners for linear family modes
     if mode in {"linear", "bilinear", "bicubic", "trilinear"}:
-        kwargs["align_corners"] = False
+        kwargs["align_corners"] = False  # pick a policy; stay consistent
 
     resampled = F.interpolate(volume, **kwargs)
 

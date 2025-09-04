@@ -244,62 +244,121 @@ class SpatialTransformer(nn.Module):
         return grid_norm
 
 
-def compute_jacobian_determinant(flow: torch.Tensor) -> torch.Tensor:
-    """
-    Compute Jacobian determinant of deformation field.
-    
-    Args:
-        flow: Deformation field (B, 3, D, H, W)
-        
-    Returns:
-        jacobian_det: Jacobian determinant (B, 1, D-2, H-2, W-2)
-    """
-    B, _, D, H, W = flow.shape
-    
+# at top of the file you already have: from typing import Optional, Tuple
+# keep that import
 
-    
-    # Compute gradients using central differences
-    # Note: This reduces spatial dimensions by 2 in each direction
-    
-    # Gradients in x direction
-    dudx = (flow[:, 0, 1:-1, 1:-1, 2:] - flow[:, 0, 1:-1, 1:-1, :-2]) / 2
-    dvdx = (flow[:, 1, 1:-1, 1:-1, 2:] - flow[:, 1, 1:-1, 1:-1, :-2]) / 2
-    dwdx = (flow[:, 2, 1:-1, 1:-1, 2:] - flow[:, 2, 1:-1, 1:-1, :-2]) / 2
-    
-    # Gradients in y direction
-    dudy = (flow[:, 0, 1:-1, 2:, 1:-1] - flow[:, 0, 1:-1, :-2, 1:-1]) / 2
-    dvdy = (flow[:, 1, 1:-1, 2:, 1:-1] - flow[:, 1, 1:-1, :-2, 1:-1]) / 2
-    dwdy = (flow[:, 2, 1:-1, 2:, 1:-1] - flow[:, 2, 1:-1, :-2, 1:-1]) / 2
-    
-    # Gradients in z direction
-    dudz = (flow[:, 0, 2:, 1:-1, 1:-1] - flow[:, 0, :-2, 1:-1, 1:-1]) / 2
-    dvdz = (flow[:, 1, 2:, 1:-1, 1:-1] - flow[:, 1, :-2, 1:-1, 1:-1]) / 2
-    dwdz = (flow[:, 2, 2:, 1:-1, 1:-1] - flow[:, 2, :-2, 1:-1, 1:-1]) / 2
-    
+def compute_jacobian_determinant(flow: torch.Tensor, spacing: Optional[torch.Tensor | tuple] = None) -> torch.Tensor:
+    """
+    Jacobian determinant with anisotropic spacing.
+    spacing: (sz, sy, sx) in mm/voxel, or None → assumes (1,1,1)
+    Returns: (B, 1, D-2, H-2, W-2)
+    """
+    # default to isotropic if not provided (keeps old call sites working)
+    if spacing is None:
+        spacing = flow.new_tensor((1.0, 1.0, 1.0))
 
-    
-    # Add identity matrix
+    # normalize spacing to device/dtype and split
+    if isinstance(spacing, torch.Tensor):
+        spacing = spacing.to(device=flow.device, dtype=flow.dtype)
+        if spacing.dim() == 1:  # (3,)
+            spacing = spacing.view(1, 3)
+        sz = spacing[..., 0].view(-1, 1, 1, 1)
+        sy = spacing[..., 1].view(-1, 1, 1, 1)
+        sx = spacing[..., 2].view(-1, 1, 1, 1)
+    else:
+        sz, sy, sx = spacing
+        sz = torch.tensor(sz, device=flow.device, dtype=flow.dtype).view(1, 1, 1, 1)
+        sy = torch.tensor(sy, device=flow.device, dtype=flow.dtype).view(1, 1, 1, 1)
+        sx = torch.tensor(sx, device=flow.device, dtype=flow.dtype).view(1, 1, 1, 1)
+
+    # central differences / spacing
+    dudx = (flow[:, 0, 1:-1, 1:-1, 2:] - flow[:, 0, 1:-1, 1:-1, :-2]) / (2 * sx)
+    dvdx = (flow[:, 1, 1:-1, 1:-1, 2:] - flow[:, 1, 1:-1, 1:-1, :-2]) / (2 * sx)
+    dwdx = (flow[:, 2, 1:-1, 1:-1, 2:] - flow[:, 2, 1:-1, 1:-1, :-2]) / (2 * sx)
+
+    dudy = (flow[:, 0, 1:-1, 2:, 1:-1] - flow[:, 0, 1:-1, :-2, 1:-1]) / (2 * sy)
+    dvdy = (flow[:, 1, 1:-1, 2:, 1:-1] - flow[:, 1, 1:-1, :-2, 1:-1]) / (2 * sy)
+    dwdy = (flow[:, 2, 1:-1, 2:, 1:-1] - flow[:, 2, 1:-1, :-2, 1:-1]) / (2 * sy)
+
+    dudz = (flow[:, 0, 2:, 1:-1, 1:-1] - flow[:, 0, :-2, 1:-1, 1:-1]) / (2 * sz)
+    dvdz = (flow[:, 1, 2:, 1:-1, 1:-1] - flow[:, 1, :-2, 1:-1, 1:-1]) / (2 * sz)
+    dwdz = (flow[:, 2, 2:, 1:-1, 1:-1] - flow[:, 2, :-2, 1:-1, 1:-1]) / (2 * sz)
+
+    # +I on diagonal
     dudx = dudx + 1
     dvdy = dvdy + 1
     dwdz = dwdz + 1
-    
-    # Check for extreme values and clip to prevent numerical instability
-    max_grad = 10.0
-    dudx = torch.clamp(dudx, -max_grad, max_grad)
-    dvdy = torch.clamp(dvdy, -max_grad, max_grad)
-    dwdz = torch.clamp(dwdz, -max_grad, max_grad)
-    dudy = torch.clamp(dudy, -max_grad, max_grad)
-    dudz = torch.clamp(dudz, -max_grad, max_grad)
-    dvdx = torch.clamp(dvdx, -max_grad, max_grad)
-    dvdz = torch.clamp(dvdz, -max_grad, max_grad)
-    dwdx = torch.clamp(dwdx, -max_grad, max_grad)
-    dwdy = torch.clamp(dwdy, -max_grad, max_grad)
-    
-    # Compute determinant
+
+    # (optional) clip off-diagonals only
+    # max_grad = 10.0
+    # dudy = torch.clamp(dudy, -max_grad, max_grad)
+    # dudz = torch.clamp(dudz, -max_grad, max_grad)
+    # dvdx = torch.clamp(dvdx, -max_grad, max_grad)
+    # dvdz = torch.clamp(dvdz, -max_grad, max_grad)
+    # dwdx = torch.clamp(dwdx, -max_grad, max_grad)
+    # dwdy = torch.clamp(dwdy, -max_grad, max_grad)
+
     det = dudx * (dvdy * dwdz - dvdz * dwdy) - \
           dudy * (dvdx * dwdz - dvdz * dwdx) + \
           dudz * (dvdx * dwdy - dvdy * dwdx)
-    
 
-    
-    return det.unsqueeze(1) 
+    return det.unsqueeze(1)
+
+
+def compute_jacobian_determinant_raw(flow: torch.Tensor, spacing: Optional[torch.Tensor | tuple] = None) -> torch.Tensor:
+    """
+    Unclamped Jacobian determinant (truthful folding stats).
+    spacing: (sz, sy, sx) or None → assumes (1,1,1)
+    Returns: (B, 1, D-2, H-2, W-2)
+    """
+    if spacing is None:
+        spacing = flow.new_tensor((1.0, 1.0, 1.0))
+
+    if isinstance(spacing, torch.Tensor):
+        spacing = spacing.to(device=flow.device, dtype=flow.dtype)
+        if spacing.dim() == 1:
+            spacing = spacing.view(1, 3)
+        sz = spacing[..., 0].view(-1, 1, 1, 1)
+        sy = spacing[..., 1].view(-1, 1, 1, 1)
+        sx = spacing[..., 2].view(-1, 1, 1, 1)
+    else:
+        sz, sy, sx = spacing
+        sz = torch.tensor(sz, device=flow.device, dtype=flow.dtype).view(1, 1, 1, 1)
+        sy = torch.tensor(sy, device=flow.device, dtype=flow.dtype).view(1, 1, 1, 1)
+        sx = torch.tensor(sx, device=flow.device, dtype=flow.dtype).view(1, 1, 1, 1)
+
+    dudx = (flow[:, 0, 1:-1, 1:-1, 2:] - flow[:, 0, 1:-1, 1:-1, :-2]) / (2 * sx)
+    dvdx = (flow[:, 1, 1:-1, 1:-1, 2:] - flow[:, 1, 1:-1, 1:-1, :-2]) / (2 * sx)
+    dwdx = (flow[:, 2, 1:-1, 1:-1, 2:] - flow[:, 2, 1:-1, 1:-1, :-2]) / (2 * sx)
+
+    dudy = (flow[:, 0, 1:-1, 2:, 1:-1] - flow[:, 0, 1:-1, :-2, 1:-1]) / (2 * sy)
+    dvdy = (flow[:, 1, 1:-1, 2:, 1:-1] - flow[:, 1, 1:-1, :-2, 1:-1]) / (2 * sy)
+    dwdy = (flow[:, 2, 1:-1, 2:, 1:-1] - flow[:, 2, 1:-1, :-2, 1:-1]) / (2 * sy)
+
+    dudz = (flow[:, 0, 2:, 1:-1, 1:-1] - flow[:, 0, :-2, 1:-1, 1:-1]) / (2 * sz)
+    dvdz = (flow[:, 1, 2:, 1:-1, 1:-1] - flow[:, 1, :-2, 1:-1, 1:-1]) / (2 * sz)
+    dwdz = (flow[:, 2, 2:, 1:-1, 1:-1] - flow[:, 2, :-2, 1:-1, 1:-1]) / (2 * sz)
+
+    dudx = dudx + 1
+    dvdy = dvdy + 1
+    dwdz = dwdz + 1
+
+    det = dudx * (dvdy * dwdz - dvdz * dwdy) - \
+          dudy * (dvdx * dwdz - dvdz * dwdx) + \
+          dudz * (dvdx * dwdy - dvdy * dwdx)
+
+    return det.unsqueeze(1)
+
+
+
+def foldings_percent(jac_det: torch.Tensor, per_sample: bool = False) -> torch.Tensor:
+    """
+    Percent of voxels with negative det(J).
+    jac_det: (B, 1, D-2, H-2, W-2)
+    Returns:
+        scalar % if per_sample=False, else (B,) tensor with per-sample %.
+    """
+    neg = (jac_det < 0).float()
+    if per_sample:
+        return neg.mean(dim=(1, 2, 3, 4)) * 100.0
+    return neg.mean() * 100.0

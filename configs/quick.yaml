@@ -33,6 +33,7 @@ data:
 
   use_labels_train: false
   use_labels_val:   false
+  image_size: [64, 64, 64]
 
 # -------- Training --------
 training:

@@ -19,10 +19,13 @@ from pathlib import Path
 from tqdm import tqdm
 import random
 import types
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
+from utils.ddp import init_distributed, is_main_process, barrier, cleanup, reduce_mean, get_rank, get_world_size
 from models.liquidreg import LiquidReg, LiquidRegLite
 from dataloaders.oasis_dataset import create_oasis_loaders
 from losses.registration_losses import CompositeLoss
@@ -47,17 +50,23 @@ def set_seed(seed: int):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
+def _select_amp_dtype(device: torch.device):
+    if device.type != "cuda":
+        return None
+    try:
+        major, minor = torch.cuda.get_device_capability(device)
+        if major >= 8:  # Ampere+
+            _ = torch.zeros(1, device=device, dtype=torch.bfloat16)
+            return torch.bfloat16
+    except Exception:
+        pass
+    return torch.float16
 
 def load_config(config_path: str) -> dict:
     """Load configuration from YAML file."""
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
-
-def is_cuda_oom(e: BaseException) -> bool:
-    msg = str(e).lower()
-    return isinstance(e, torch.cuda.OutOfMemoryError) or ("out of memory" in msg)
-
 
 def create_model(config: dict) -> nn.Module:
     """Create model based on configuration."""
@@ -344,29 +353,34 @@ def safe_collate(batch, *, min_batch: int = 1):
         return None
     return default_collate(batch)
 
-def make_safe_loader(loader: DataLoader, *, split_name: str, logger: SummaryWriter, num_workers: int, pin_memory: bool = True) -> DataLoader:
-    """
-    Rebuild a DataLoader with SafeDataset + safe_collate. We keep the batch_size from the original loader
-    and sensible perf params.
-    """
+def make_safe_loader(
+    loader: torch.utils.data.DataLoader,
+    *,
+    split_name: str,
+    logger: SummaryWriter,
+    num_workers: int,
+    pin_memory: bool = True,
+    sampler=None
+) -> torch.utils.data.DataLoader:
     base_ds = loader.dataset
-    safe_ds = SafeDataset(base_ds, logger=logger, split_name=split_name)
+    safe_ds = SafeDataset(base=base_ds, logger=logger, split_name=split_name)
 
-    # train: shuffle, val: no shuffle
-    shuffle = (split_name == "train")
-
-    return DataLoader(
-        safe_ds,
+    shuffle = (sampler is None) and (split_name == "train")
+    return torch.utils.data.DataLoader(
+        dataset=safe_ds,
         batch_size=loader.batch_size,
         shuffle=shuffle,
+        sampler=sampler,                 # <- preserve DDP sharding
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=safe_collate,
-        drop_last=False,
+        drop_last=loader.drop_last,
         persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
-        timeout=0
+        timeout=0,
+        **({"prefetch_factor": 2} if num_workers > 0 else {})
     )
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -387,10 +401,12 @@ def train_epoch(
     total_loss = 0.0
     total_losses = {}
     num_batches = len(train_loader)
-    
+
+    dropped_batches = 0
+    max_dropped = max(5, int(0.2 * num_batches))  # e.g., 20% or at least 5
+
     start_time_epoch = time.time()
 
-    num_batches = len(train_loader)  # keep your existing variable
     pbar = tqdm(total=num_batches, desc=f"Epoch {epoch}")
     it = iter(train_loader)
     batch_idx = 0
@@ -410,12 +426,26 @@ def train_epoch(
                             epoch * max(1, num_batches) + batch_idx)
             batch_idx += 1
             pbar.update(1)
+
+            dropped_batches += 1
+            if dropped_batches > max_dropped:
+                if fail_fast:
+                    raise RuntimeError("Too many dropped batches; failing fast.")
+                print(f"[WARN] Too many dropped batches ({dropped_batches}/{num_batches}). Continuing, but data may be corrupted.")
+
             continue
 
         # SafeDataset+safe_collate may hand us None when all items were bad
         if batch is None:
             batch_idx += 1
             pbar.update(1)
+            
+            dropped_batches += 1
+            if dropped_batches > max_dropped:
+                if fail_fast:
+                    raise RuntimeError("Too many dropped batches; failing fast.")
+                print(f"[WARN] Too many dropped batches ({dropped_batches}/{num_batches}). Continuing, but data may be corrupted.")
+            
             continue
 
         fixed = batch['fixed'].float()
@@ -434,12 +464,13 @@ def train_epoch(
         try:
             # Try new API first
             from torch.amp import autocast
+            amp_dtype = _select_amp_dtype(device)
             autocast_context = autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype)
-
-        except TypeError:
-            # Fallback to old API
-            from torch.cuda.amp import autocast as cuda_autocast
-            autocast_context = cuda_autocast(enabled=use_amp)
+        
+        except TypeError:            
+            from torch.cuda.amp import autocast
+            # old API: omit dtype
+            autocast_context = autocast(enabled=use_amp)
         
         try:
             with autocast_context:
@@ -460,6 +491,9 @@ def train_epoch(
                 )
                 
                 loss = losses['total']
+                
+                loss_log = reduce_mean(loss.detach())
+
         except Exception as e:
             print(f"[ERROR] Exception in forward pass: {e}")
             import traceback
@@ -565,7 +599,7 @@ def train_epoch(
         # Log to tensorboard (per step)
         if batch_idx % config['logging']['log_interval'] == 0:
             step = epoch * num_batches + batch_idx
-            writer.add_scalar('train/loss', loss.item(), step)
+            writer.add_scalar('train/loss', loss_log.item(), step)
             writer.add_scalar('train/grad_norm', grad_norm, step)
             writer.add_scalar('train/iter_time_s', iter_time, step)
             writer.add_scalar('train/throughput_items_per_s', throughput, step)
@@ -602,7 +636,11 @@ def train_epoch(
     epoch_time = time.time() - start_time_epoch
     writer.add_scalar('train/epoch_time_s', epoch_time, epoch)
     if num_batches > 0:
-        writer.add_scalar('train/epoch_avg_ips', (len(train_loader.dataset) / epoch_time) if hasattr(train_loader, "dataset") else (num_batches * batch_size / epoch_time), epoch)
+        # Fallback to config batch_size if we never saw a batch_size variable
+        bs = locals().get("batch_size", config['data']['batch_size'])
+        denom = max(epoch_time, 1e-8)
+        items = (len(train_loader.dataset) if hasattr(train_loader, "dataset") else (num_batches * bs))
+        writer.add_scalar('train/epoch_avg_ips', items / denom, epoch)
 
     # Average losses
     avg_losses = {key: value / num_batches for key, value in total_losses.items()} if num_batches > 0 else {}
@@ -620,14 +658,20 @@ def validate_epoch(
     fail_fast=False
 ) -> dict:
     """Validate for one epoch."""
+    
+    base = model.module if hasattr(model, "module") else model
+
     model.eval()
     
     total_loss = 0.0
     total_losses = {}
     num_batches = len(val_loader)
     
+    dropped_batches = 0
+    max_dropped = max(5, int(0.2 * num_batches))  # e.g., 20% or at least 5
+
+    
     with torch.no_grad():
-        num_batches = len(val_loader)
         pbar = tqdm(total=num_batches, desc=f"Validation {epoch}")
         it = iter(val_loader)
         batch_idx = 0
@@ -645,11 +689,27 @@ def validate_epoch(
                                 epoch * max(1, num_batches) + batch_idx)
                 batch_idx += 1
                 pbar.update(1)
+                
+                dropped_batches += 1
+                if dropped_batches > max_dropped:
+                    if fail_fast:
+                        raise RuntimeError("Too many dropped batches; failing fast.")
+                    print(f"[WARN] Too many dropped batches ({dropped_batches}/{num_batches}). Continuing, but data may be corrupted.")
+
                 continue
+
+
 
             if batch is None:
                 batch_idx += 1
                 pbar.update(1)
+                
+                dropped_batches += 1
+                if dropped_batches > max_dropped:
+                    if fail_fast:
+                        raise RuntimeError("Too many dropped batches; failing fast.")
+                    print(f"[WARN] Too many dropped batches ({dropped_batches}/{num_batches}). Continuing, but data may be corrupted.")
+
                 continue
 
             fixed = batch['fixed'].float()
@@ -671,50 +731,71 @@ def validate_epoch(
                 from torch.cuda.amp import autocast as cuda_autocast
                 autocast_context = cuda_autocast(enabled=use_amp)
             
-            with autocast_context:
-                output = model(fixed, moving, return_intermediate=True)
-                
-                warped = output['warped_moving']
-                velocity = output['velocity_field']
-                jacobian_det = output['jacobian_det']
-                liquid_params = output['liquid_params']
-                deformation = output['deformation_field']
+            try:
+                with autocast_context:
+                    output = model(fixed, moving, return_intermediate=True)
+                    
+                    warped = output['warped_moving']
+                    velocity = output['velocity_field']
+                    jacobian_det = output['jacobian_det']
+                    liquid_params = output['liquid_params']
+                    deformation = output['deformation_field']
 
-                # ---- Optional Dice logging if labels are in the batch ----
-                if ('segmentation_fixed' in batch and 'segmentation_moving' in batch
-                    and batch['segmentation_fixed'] is not None and batch['segmentation_moving'] is not None):
-                    fseg = batch['segmentation_fixed'].to(device, non_blocking=True).long()  # (N,1,D,H,W)
-                    mseg = batch['segmentation_moving'].to(device, non_blocking=True).long()
+                    # ---- Optional Dice logging if labels are in the batch ----
+                    if ('segmentation_fixed' in batch and 'segmentation_moving' in batch
+                        and batch['segmentation_fixed'] is not None and batch['segmentation_moving'] is not None):
+                        fseg = batch['segmentation_fixed'].to(device, non_blocking=True).long()  # (N,1,D,H,W)
+                        mseg = batch['segmentation_moving'].to(device, non_blocking=True).long()
 
-                    # Binary foreground Dice (quick + robust)
-                    ffg = (fseg > 0).float()
-                    mfg = (mseg > 0).float()
+                        # Binary foreground Dice (quick + robust)
+                        ffg = (fseg > 0).float()
+                        mfg = (mseg > 0).float()
 
-                    # Make 2-class one-hot [bg, fg]
-                    m2 = torch.cat([(1.0 - mfg), mfg], dim=1)  # (N,2,D,H,W)
+                        # Make 2-class one-hot [bg, fg]
+                        m2 = torch.cat([(1.0 - mfg), mfg], dim=1)  # (N,2,D,H,W)
 
-                    # Use the same transformer as images
-                    w2 = model.spatial_transformer(m2, deformation)  # bilinear ok for probs
-                    wfg = w2[:, 1:2, ...]  # foreground prob
+                        # Use the same transformer as images
+                        w2 = base.spatial_transformer(m2, deformation)  # bilinear ok for probs
+                        wfg = w2[:, 1:2, ...]  # foreground prob
 
-                    eps = 1e-6
-                    inter = (wfg * ffg).sum(dim=(1,2,3,4))
-                    denom = wfg.sum(dim=(1,2,3,4)) + ffg.sum(dim=(1,2,3,4))
-                    dice_fg = ((2 * inter + eps) / (denom + eps)).mean().item()
-                    writer.add_scalar('val/dice_fg', dice_fg, epoch)
+                        eps = 1e-6
+                        inter = (wfg * ffg).sum(dim=(1,2,3,4))
+                        denom = wfg.sum(dim=(1,2,3,4)) + ffg.sum(dim=(1,2,3,4))
+                        dice_fg = ((2 * inter + eps) / (denom + eps)).mean().item()
+                        writer.add_scalar('val/dice_fg', dice_fg, epoch)
 
-                
-                # Compute losses
-                losses = criterion(
-                    fixed=fixed,
-                    warped=warped,
-                    velocity_field=velocity,
-                    jacobian_det=jacobian_det,
-                    liquid_params=liquid_params
-                )
-                
-                loss = losses['total']
-            
+                    
+                    # Compute losses
+                    losses = criterion(
+                        fixed=fixed,
+                        warped=warped,
+                        velocity_field=velocity,
+                        jacobian_det=jacobian_det,
+                        liquid_params=liquid_params
+                    )
+                    
+                    loss = losses['total']
+
+            except RuntimeError as e:
+                if is_cuda_oom(e):
+                    if fail_fast: raise
+                    print(f"[WARN] Val OOM at epoch {epoch} batch {batch_idx}: {e}")
+                    writer.add_scalar('errors/val_oom', 1, epoch * max(1, num_batches) + batch_idx)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.reset_peak_memory_stats()
+                    batch_idx += 1
+                    pbar.update(1)
+                    continue
+                else:
+                    if fail_fast: raise
+                    print(f"[WARN] Val runtime error at epoch {epoch} batch {batch_idx}: {e}")
+                    writer.add_text('errors/val_forward_runtime', f"epoch={epoch} batch={batch_idx} err={e}",
+                                    epoch * max(1, num_batches) + batch_idx)
+                    batch_idx += 1
+                    pbar.update(1)
+                    continue
+
             # Accumulate losses
             total_loss += loss.item()
             for key, value in losses.items():
@@ -727,7 +808,7 @@ def validate_epoch(
             # Per-batch val logging
             if batch_idx % max(1, config['logging']['log_interval']) == 0:
                 step = epoch * num_batches + batch_idx
-                writer.add_scalar('val/step_loss', loss.item(), step)
+                writer.add_scalar('val/step_loss', reduce_mean(loss.detach()).item(), step)
                 _add_images(writer, "val/images", fixed, moving, warped, step,
                             plane="axial", out_hw=384, grid_slices=0)
                 _field_stats_and_hists(
@@ -777,9 +858,10 @@ def save_checkpoint(
     writer: SummaryWriter = None
 ):
     """Save model checkpoint."""
+    base = model.module if hasattr(model, "module") else model
     checkpoint = {
         'epoch': epoch,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': base.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
         'config': config,
@@ -820,6 +902,13 @@ def _update_ckpt_aliases(checkpoint_path: str, is_best: bool):
         best_ptr = base / "best.pth"
         _atomic_copy(str(ckpt), str(best_ptr))
 
+import builtins
+
+def make_qprint(is_main: bool):
+    def _qprint(*a, **k):
+        if is_main:
+            builtins.print(*a, **k)
+    return _qprint
 
 def main():
     parser = argparse.ArgumentParser(description='Train LiquidReg model')
@@ -848,11 +937,27 @@ def main():
     # add with the other flags
     parser.add_argument('--fail_fast', action='store_true',
                     help='Abort immediately on any batch/data error (default: skip bad batches)')
+    parser.add_argument("--ddp", action="store_true", help="Enable multi-GPU via torchrun.")
+    parser.add_argument("--no_amp", action="store_true", help="Disable AMP mixed precision.")
 
 
 
     args = parser.parse_args()
     
+    ## DDP / device
+    use_amp = not args.no_amp  # CLI default; we’ll combine with config after load
+    
+    # Initialize distributed (if launched with torchrun and --ddp)
+    is_ddp, local_rank, device = (init_distributed(backend="nccl") if args.ddp
+                                else (False, 0, torch.device("cuda" if torch.cuda.is_available() else "cpu")))
+    main_process = is_main_process()
+    rank = get_rank()
+    world = get_world_size()
+
+    qprint = make_qprint(main_process)
+
+    qprint(f"[DDP] enabled={is_ddp} world={world} rank={rank} local_rank={local_rank} device={device}")
+
     # Load configuration
     config = load_config(args.config)
     
@@ -908,11 +1013,10 @@ def main():
     set_seed(config['seed'])
     
     # Setup device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    # pick an AMP dtype; BF16 is safe (no loss-scaling needed) on Ampere+
-    use_amp = bool(config['training'].get('use_amp', True) and device.type == 'cuda')
-
+    # Honor both CLI and config; store back into config so all helpers read the same truth.
+    use_amp = (not args.no_amp) and bool(config['training'].get('use_amp', True)) and (device.type == 'cuda')
+    config['training']['use_amp'] = use_amp
     # Create output directories
     log_dir = Path(config['logging']['log_dir']) / config['logging']['experiment_name']
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -921,7 +1025,9 @@ def main():
     checkpoint_dir.mkdir(exist_ok=True)
     
     # Setup logging
-    writer = SummaryWriter(log_dir / 'tensorboard')
+    # one logdir per rank to avoid file contention
+    writer = SummaryWriter((log_dir / 'tensorboard' / f"rank{rank}"))
+
 
     # Log config & hparams up front
     try:
@@ -944,62 +1050,70 @@ def main():
         pass
     
     # Create data loaders
-    if args.train_pairs and args.val_pairs:
-        from dataloaders.reg_pairs_dataset import create_loaders_from_pairs
-        train_loader, val_loader, _ = create_loaders_from_pairs(
-            args.train_pairs,
-            args.val_pairs,
-            batch_size=config['data']['batch_size'],
-            patch_size=config['data']['patch_size'],
-            patches_per_pair=config['data']['patches_per_pair'],
-            num_workers=config['data']['num_workers'],
-            patch_stride=config['data']['patch_stride'],
-            use_labels_train=True,
-            use_labels_val=True,
-            target_size=tuple(config['model']['image_size']),
-        )
-    else:
-        from dataloaders.oasis_dataset import create_oasis_loaders
-        train_loader, val_loader = create_oasis_loaders(
-            data_root=config['data']['data_root'],
-            batch_size=config['data']['batch_size'],
-            patch_size=config['data']['patch_size'],
-            patch_stride=config['data']['patch_stride'],
-            patches_per_pair=config['data']['patches_per_pair'],
-            num_workers=config['data']['num_workers']
-        )
+    from dataloaders.reg_pairs_dataset import create_reg_pairs_loaders_ddp
 
-    # If small_dataset flag is set, use only 1% of the dataset
+    assert args.train_pairs and args.val_pairs, \
+        "This project now trains on pairs CSVs. Provide --train_pairs and --val_pairs."
+
+    train_loader, val_loader, train_sampler, val_sampler = create_reg_pairs_loaders_ddp(
+        train_pairs_csv=args.train_pairs,
+        val_pairs_csv=args.val_pairs,
+        batch_size=config['data']['batch_size'],
+        patch_size=config['data']['patch_size'],
+        patch_stride=config['data']['patch_stride'],
+        patches_per_pair=config['data']['patches_per_pair'],
+        num_workers=config['data']['num_workers'],
+        use_labels_train=True,
+        use_labels_val=True,
+        target_size=tuple(config['model']['image_size']),
+        distributed=is_ddp,
+    )
+
+    from torch.utils.data.distributed import DistributedSampler
+    
     if args.small_dataset:
         print("Using small dataset (1 percent of the full dataset)")
-        # Create subset of the training data (1%)
+
+        # train subset
         train_size = len(train_loader.dataset)
-        small_size = max(1, int(train_size * 0.01))  # At least 1 sample
-        indices = torch.randperm(train_size)[:small_size]
-        train_subset = torch.utils.data.Subset(train_loader.dataset, indices)
-        
-        # Create new DataLoader with the subset
-        train_loader = torch.utils.data.DataLoader(
-            train_subset,
-            batch_size=config['data']['batch_size'],
-            shuffle=True,
-            num_workers=config['data']['num_workers'],
-            pin_memory=True
-        )
-        
-        # Also reduce validation set size
+        small_size = max(1, int(train_size * 0.01))
+        idx_train = torch.randperm(train_size)[:small_size]
+        train_subset = torch.utils.data.Subset(train_loader.dataset, idx_train)
+        if is_ddp:
+            train_sampler = DistributedSampler(train_subset, shuffle=True, drop_last=True)
+            train_loader = torch.utils.data.DataLoader(
+                train_subset, batch_size=config['data']['batch_size'],
+                shuffle=False, sampler=train_sampler,
+                num_workers=config['data']['num_workers'], pin_memory=True, drop_last=True,
+                persistent_workers=(config['data']['num_workers'] > 0),
+            )
+        else:
+            train_loader = torch.utils.data.DataLoader(
+                train_subset, batch_size=config['data']['batch_size'],
+                shuffle=True, num_workers=config['data']['num_workers'], pin_memory=True, drop_last=True,
+                persistent_workers=(config['data']['num_workers'] > 0),
+            )
+
+        # val subset
         val_size = len(val_loader.dataset)
         small_val_size = max(1, int(val_size * 0.01))
-        val_indices = torch.randperm(val_size)[:small_val_size]
-        val_subset = torch.utils.data.Subset(val_loader.dataset, val_indices)
-        
-        val_loader = torch.utils.data.DataLoader(
-            val_subset,
-            batch_size=config['data']['batch_size'],
-            shuffle=False,
-            num_workers=config['data']['num_workers'],
-            pin_memory=True
-        )
+        idx_val = torch.randperm(val_size)[:small_val_size]
+        val_subset = torch.utils.data.Subset(val_loader.dataset, idx_val)
+        if is_ddp:
+            val_sampler = DistributedSampler(val_subset, shuffle=False, drop_last=False)
+            val_loader = torch.utils.data.DataLoader(
+                val_subset, batch_size=config['data']['batch_size'],
+                shuffle=False, sampler=val_sampler,
+                num_workers=config['data']['num_workers'], pin_memory=True, drop_last=False,
+                persistent_workers=(config['data']['num_workers'] > 0),
+            )
+        else:
+            val_loader = torch.utils.data.DataLoader(
+                val_subset, batch_size=config['data']['batch_size'],
+                shuffle=False, num_workers=config['data']['num_workers'], pin_memory=True, drop_last=False,
+                persistent_workers=(config['data']['num_workers'] > 0),
+            )
+
     
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
@@ -1008,13 +1122,21 @@ def main():
 
     if not FAIL_FAST:
         train_loader = make_safe_loader(train_loader, split_name="train", logger=writer,
-                                        num_workers=config['data']['num_workers'])
+                                        num_workers=config['data']['num_workers'], sampler=train_sampler)
         val_loader   = make_safe_loader(val_loader,   split_name="val",   logger=writer,
-                                        num_workers=config['data']['num_workers'])
+                                        num_workers=config['data']['num_workers'], sampler=val_sampler)
+
     
     # Create model
     model = create_model(config)
     model = model.to(device=device, dtype=torch.float32)
+    
+    # model.to(device)
+    if is_ddp:
+        model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None,
+                    output_device=local_rank if device.type == "cuda" else None,
+                    find_unused_parameters=False)
+
     
     # Try to log the model graph (best-effort)
     try:
@@ -1026,30 +1148,32 @@ def main():
         writer.add_graph(model, (dummy_fixed, dummy_moving), use_strict_trace=False)
     except Exception:
         pass
-    
-    # Enable gradient checkpointing if requested
+
+    # Enable gradient checkpointing if requested (DDP-safe)
     if args.gradient_checkpointing:
         print("Enabling gradient checkpointing to save memory")
-        # Enable gradient checkpointing for the model
-        if hasattr(model, 'encoder') and hasattr(model.encoder, 'encoder'):
-            model.encoder.encoder.gradient_checkpointing_enable()
+        _m = model.module if hasattr(model, "module") else model  # <- use the base module
+
+        # Encoder (if it supports HF-style GC)
+        if hasattr(_m, 'encoder') and hasattr(_m.encoder, 'encoder'):
+            _m.encoder.encoder.gradient_checkpointing_enable()
             print("Gradient checkpointing enabled for encoder")
-        if hasattr(model, 'liquid_core'):
+
+        # Liquid core: wrap its forward with torch.utils.checkpoint
+        if hasattr(_m, 'liquid_core'):
             import torch.utils.checkpoint as cp
-            original_forward = model.liquid_core.forward  # this is already a *bound* method
+            original_forward = _m.liquid_core.forward  # bound method on the base module
 
             def checkpointed_forward(self, coords, params):
-                # call the bound method without passing `self` again
-                return cp.checkpoint(
-                    lambda c, p: original_forward(c, p),
-                    coords, params,
-                    preserve_rng_state=True
-                )
+                # Keep signature; wrap compute in checkpoint
+                return cp.checkpoint(lambda c, p: original_forward(c, p),
+                                    coords, params,
+                                    preserve_rng_state=True)
 
-            model.liquid_core.forward = types.MethodType(checkpointed_forward, model.liquid_core)
+            _m.liquid_core.forward = types.MethodType(checkpointed_forward, _m.liquid_core)
             print("Gradient checkpointing enabled for liquid_core")
 
-    
+
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1099,7 +1223,7 @@ def main():
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt['model_state_dict'])
+        (model.module if hasattr(model, "module") else model).load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         if 'scheduler_state_dict' in ckpt and scheduler is not None:
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
@@ -1111,6 +1235,10 @@ def main():
 
     
     for epoch in range(start_epoch, config['training']['num_epochs']):
+        
+        if is_ddp and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         print(f"\nEpoch {epoch}/{config['training']['num_epochs']}")
         writer.add_scalar('train/learning_rate', optimizer.param_groups[0]['lr'], epoch)
         
@@ -1152,7 +1280,7 @@ def main():
                 writer.add_scalar('val/no_improve_streak', early_stopping_counter, epoch)
             
             # Save checkpoint
-            if epoch % config['logging']['save_interval'] == 0 or is_best:
+            if main_process and (epoch % config['logging']['save_interval'] == 0 or is_best):
                 checkpoint_path = checkpoint_dir / f'epoch_{epoch}.pth'
                 save_checkpoint(
                     model, optimizer, scheduler, epoch, current_loss, 
@@ -1178,14 +1306,21 @@ def main():
         writer.add_scalar('train/learning_rate_post_step', current_lr, epoch)
     
     # Save final model
-    final_path = checkpoint_dir / 'final_model.pth'
-    save_checkpoint(
-        model, optimizer, scheduler, epoch, 
-        val_losses['avg_loss'] if 'val_losses' in locals() else train_losses['avg_loss'], 
-        config, str(final_path), writer=writer
-    )
+    if main_process:
+        final_path = checkpoint_dir / 'final_model.pth'
+        save_checkpoint(
+            model, optimizer, scheduler, epoch, 
+            val_losses['avg_loss'] if 'val_losses' in locals() else train_losses['avg_loss'], 
+            config, str(final_path), writer=writer
+        )
     
-    writer.close()
+    # writer.close()
+    
+    barrier()
+    if writer:
+        writer.flush(); writer.close()
+    cleanup()
+    
     print("Training completed!")
 
 
