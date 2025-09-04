@@ -8,8 +8,8 @@ shopt -s globstar nullglob
 # =======================
 
 # ---- constants ----
-# SEEDS=(0 1 2)                 # number of random restarts per model
-SEEDS=( 1 )
+
+SEEDS=( 1 )                   # seeds for multiple runs
 PAIRS_K=5                     # partners per subject in each CSV
 PAIRS_SEED=123                # deterministic sampling for pairs
 CONFIG_LIST_FILE="configs/cfgs_to_run.txt"  # optional list of configs to run
@@ -20,12 +20,8 @@ MAX_PAIRS_OASIS_TRAIN=1000
 MAX_PAIRS_OASIS_VAL=100
 MAX_PAIRS_IXI=100
 MAX_PAIRS_L2R=100
-# MAX_PAIRS_OASIS_TEST=2
-# MAX_PAIRS_OASIS_TRAIN=5
-# MAX_PAIRS_OASIS_VAL=2
-# MAX_PAIRS_IXI=2
-# MAX_PAIRS_L2R=2
-RESUME_FROM_CHECKPOINT=0  # 0/1: resume from best available checkpoint in work dir
+
+RESUME_FROM_CHECKPOINT=1  # 0/1: resume from best available checkpoint in work dir
 
 # data layout (produced by setup_data.sh)
 OASIS_TRAIN="data/OASIS_train"

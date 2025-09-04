@@ -37,7 +37,7 @@ data:
 
 # -------- Training --------
 training:
-  num_epochs: 5
+  num_epochs: 300
   learning_rate: 2.0e-4
   weight_decay: 1.0e-4
   optimizer: "adamw"            # "adam", "adamw", "sgd"
