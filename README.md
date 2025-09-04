@@ -1,85 +1,75 @@
-# LiquidReg — Adaptive ODE Engine for Deformable Registration
+# LiquidReg
 
-LiquidReg introduces a revolutionary approach to deformable medical image registration by combining Liquid Time-constant Networks (LTC) for adaptive dynamics, diffeomorphic transformations via scaling & squaring, hyper-networks for pair-specific parameter generation, and continuous-time ODE solvers for smooth deformation fields.
-
-With only ~50k parameters (25× fewer than TransMorph), LiquidReg achieves competitive accuracy while being hardware-friendly and inherently diffeomorphic.
-
-## Key Features
-
-- **Ultra-lightweight**: Only 50k parameters vs 10M+ in traditional methods
-- **Adaptive dynamics**: Liquid cells adjust time constants based on anatomical context
-- **Guaranteed diffeomorphism**: Exponential map ensures invertible transformations
-- **Pair-specific adaptation**: Hyper-network generates custom parameters for each image pair
-- **Memory efficient**: Half-precision adjoint ODE solving with checkpointing
-- **Fast inference**: ~90ms on RTX 4090 for 128³ volumes
-
-## Installation
+**One command to run everything:**
 
 ```bash
-# Clone repository
-git clone https://github.com/yourusername/LiquidReg.git
-cd LiquidReg
-
-# Install dependencies
-pip install -r requirements.txt
+bash run_all.sh
 ```
 
-## Quick Start
+That’s it. The script sets up the environment (conda must be installed) downloads and sets up data pairs, trains/validates on **OASIS**, and evaluates on **IXI** and **L2R**. Multi-GPU is handled automatically (DDP via `torchrun` if >1 GPU; otherwise plain Python).
 
-### Training
-```bash
-python scripts/train.py --config configs/default.yaml --data_root /path/to/data
-```
+---
 
-### Inference
-```bash
-python scripts/inference.py \
-    --fixed /path/to/fixed.nii.gz \
-    --moving /path/to/moving.nii.gz \
-    --model /path/to/checkpoint.pth \
-    --output /path/to/results/
-```
+## What it does
 
-## Mathematical Foundation
+* **Data prep:** builds CSVs of registration pairs for:
 
-### Liquid Time-constant Dynamics
-```
-ḣ = -1/τ(h,u) ⊙ h + σ(W_h h + U_h u + b_h)
-τ = τ_min + softplus(W_τ h + U_τ u + b_τ)
-```
+  * `data/OASIS_train`, `data/OASIS_val`, `data/OASIS_test`
+  * `data/gen_IXI_eval` (image-only metrics)
+  * `data/gen_L2R` (labels if present)
+* **Training:** pairs-CSV pipeline on OASIS (train/val).
+* **Evaluation:** runs on OASIS test, IXI, and L2R using the trained checkpoint.
+* **DDP:** classic data parallel. Gradients are synchronized; **only rank-0** writes TensorBoard and checkpoints.
 
-### Diffeomorphic Integration
-```
-φ = exp(v) via scaling-&-squaring
-Guaranteed: det(∇φ) > 0 everywhere
-```
+---
 
-## Project Structure
+## Outputs
 
 ```
-LiquidReg/
-├── models/                 # Core model implementations
-├── losses/                 # Loss functions
-├── dataloaders/           # Data loading utilities
-├── utils/                 # Utility functions
-├── configs/               # Configuration files
-└── scripts/               # Training/inference scripts
+runs/<experiment>/<seed>/
+  checkpoints/
+    best.pth         # single checkpoint (saved by rank-0)
+  tensorboard/
+    events...        # single TB stream (rank-0)
+  eval/
+    oasis_test/      # metrics.csv, summary.txt
+    ixi/
+    l2r/
 ```
 
-## Performance
+---
 
-| Model | Parameters | Memory | Time | Dice |
-|-------|------------|--------|------|------|
-| VoxelMorph | 4.0M | 8.2GB | 45ms | 0.82 |
-| TransMorph | 64.0M | 12.5GB | 120ms | 0.85 |
-| **LiquidReg** | **0.05M** | **4.8GB** | **--ms** | **--** |
+## Data & pairs format
 
-## Citation
+* CSV columns: `fixed, moving` and optionally `fixed_seg, moving_seg`.
+* IXI typically has no segmentations; Dice/HD95 are computed only when labels exist.
 
-```bibtex
-@article{liquidreg2024,
-  title={LiquidReg: Liquid Neural Networks for Deformable Medical Image Registration},
-  author={Ali Mikaeili Barzili},
-  year={2025}
-}
-``` 
+---
+
+## Key files (the ones that matter)
+
+* `run_all.sh` — orchestrates data → train → eval (single command).
+* `scripts/train.py` — training entrypoint (pairs-based loader, DDP-ready).
+* `scripts/eval_pairs.py` — batch evaluator over a pairs CSV.
+* `scripts/make_pairs.py` — creates deterministic pair lists.
+* `dataloaders/reg_pairs_dataset.py` — **main** dataset/augment/patch loader.
+* `models/` — `LiquidReg`, `LiquidRegLite`, transforms.
+* `utils/` — preprocessing (normalize/resample), patch utils, misc helpers.
+* `configs/` — configs and optional `cfgs_to_run.txt` list.
+
+---
+
+## Legacy (will be removed)
+
+* `dataloaders/oasis_dataset.py` and any old “oasis\_\*” dataloader variants.
+* Misc experimental/legacy scripts not referenced by `run_all.sh`.
+
+> Only follow the chain started by `run_all.sh`. Other files are legacy or experimental.
+
+---
+
+## Minimal notes
+
+* **Checkpoint to use:** `runs/<experiment>/<seed>/checkpoints/best.pth`
+* **TensorBoard:** `runs/<experiment>/<seed>/tensorboard/ 
+* **DDP behavior:** automatic with multiple GPUs; data folder is unchanged.
