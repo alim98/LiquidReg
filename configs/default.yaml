@@ -1,0 +1,94 @@
+# =========================
+# LiquidReg Paper Baseline
+# =========================
+
+# -------- Model --------
+model:
+  name: "LiquidReg"
+  image_size: [128, 128, 128]
+  encoder_type: "cnn"          # "cnn" or "swin"
+  encoder_channels: 256
+  liquid_hidden_dim: 64
+  liquid_num_steps: 10
+  velocity_scale: 1.0
+  num_squaring: 6
+  fusion_type: "concat_pool"   # ablate: "attention", "gated"
+
+# -------- Data (pairs-CSV) --------
+data:
+  train_pairs: "data/OASIS_train/pairs_train.csv"
+  val_pairs:   "data/OASIS_val/pairs_val.csv"
+  test_pairs:  "data/OASIS_test/pairs_test.csv"
+
+  batch_size: 2
+  num_workers: 8
+  pin_memory: true
+
+  patch_size: 64
+  patch_stride: 32
+  patches_per_pair: 32
+
+  use_augmentation: true
+  augmentation_prob: 0.8
+
+  use_labels_train: true
+  use_labels_val:   true
+  image_size: [128, 128, 128]
+
+# -------- Training --------
+training:
+  num_epochs: 300
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-4
+  optimizer: "adamw"            # "adam", "adamw", "sgd"
+  scheduler: "cosine"           # "cosine", "step", "plateau"
+
+  # Loss weights
+  lambda_similarity: 1.0
+  lambda_jacobian: 0.5
+  lambda_velocity: 0.01
+  lambda_liquid: 0.001
+
+  similarity_loss: "lncc"       # "lncc", "mse", "mi"
+  lncc_window: 9
+  jacobian_penalty: "l2"        # "l2", "log"
+
+  grad_clip_norm: 1.0
+  use_amp: true
+
+  early_stopping_patience: 30
+  early_stopping_delta: 1.0e-4
+
+# -------- Validation --------
+validation:
+  eval_interval: 1              # validate every epoch
+  save_best: true               # best = lowest val loss
+  save_last: true
+  compute_metrics: true
+
+# -------- Logging --------
+logging:
+  log_dir: "runs"
+  experiment_name: "liquidreg_paper_baseline"
+  log_interval: 50
+  save_interval: 25
+  wandb: false
+  tensorboard: true
+
+# -------- Hardware --------
+device:
+  gpu_ids: [0]
+  mixed_precision: true
+  compile_model: true           # PyTorch 2.x compile; set false if unstable
+
+# -------- Repro --------
+seed: 42
+deterministic: true
+
+# -------- Metrics / Viz --------
+metrics:
+  compute_dice: true            # still logged during eval if segs exist
+  compute_jacobian_stats: true
+  compute_deformation_magnitude: true
+  save_visualizations: true
+  num_vis_samples: 5

@@ -1,0 +1,101 @@
+# LiquidReg Default Configuration
+
+# Model Configuration
+model:
+  name: "LiquidReg"
+  image_size: [128, 128, 128]
+  encoder_type: "cnn"  # "cnn" or "swin"
+  encoder_channels: 256
+  liquid_hidden_dim: 64
+  liquid_num_steps: 8
+  velocity_scale: 1.0
+  num_squaring: 6
+  fusion_type: "concat_pool"  # "concat_pool", "attention", "gated"
+
+# Data Configuration
+data:
+  data_root: "data"
+  train_dir: "L2R_2021_Task3_train"
+  val_dir: "L2R_2021_Task3_val"
+  test_dir: null
+  batch_size: 1
+  num_workers: 4
+  pin_memory: true
+  
+  # # Patch settings
+  # patch_size: 64
+  # patch_stride: 32
+  # patches_per_pair: 20
+  
+  # Patch settings
+  patch_size: 32
+  patch_stride: 16
+  patches_per_pair: 10
+  
+  # Preprocessing
+  normalize_method: "zscore"  # "zscore", "minmax", "percentile"
+  use_augmentation: true
+  augmentation_prob: 0.5
+
+# Training Configuration
+training:
+  num_epochs: 1
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-6
+  optimizer: "adamw"  # "adam", "adamw", "sgd"
+  scheduler: "cosine"  # "cosine", "step", "plateau"
+  
+  # Loss weights
+  lambda_similarity: 1.0
+  lambda_jacobian: 1.0
+  lambda_velocity: 0.01
+  lambda_liquid: 0.001
+  
+  # Loss configuration
+  similarity_loss: "lncc"  # "lncc", "mse", "mi"
+  lncc_window: 9
+  jacobian_penalty: "l2"  # "l2", "log"
+  
+  # Gradient clipping
+  grad_clip_norm: 1.0
+  
+  # Mixed precision
+  use_amp: false
+  
+  # Early stopping
+  early_stopping_patience: 20
+  early_stopping_delta: 1.0e-4
+
+# Validation Configuration
+validation:
+  eval_interval: 5  # epochs
+  save_best: true
+  save_last: true
+  compute_metrics: true
+
+# Logging Configuration
+logging:
+  log_dir: "logs"
+  experiment_name: "liquidreg_default"
+  log_interval: 10  # batches
+  save_interval: 20  # epochs
+  wandb: false
+  tensorboard: true
+
+# Hardware Configuration
+device:
+  gpu_ids: [0]
+  mixed_precision: true
+  compile_model: false  # PyTorch 2.0 compile
+
+# Reproducibility
+seed: 42
+deterministic: false  # Set to true for full reproducibility (slower)
+
+# Evaluation Metrics
+metrics:
+  compute_dice: true
+  compute_jacobian_stats: true
+  compute_deformation_magnitude: true
+  save_visualizations: true
+  num_vis_samples: 5 
