@@ -10,10 +10,11 @@
 #SBATCH --gres=gpu:a100:4
 #SBATCH --time=24:00:00
 #SBATCH --mail-user=your_email@domain
-
 module purge
 module load intel/21.2.0 impi/2021.2
 
+# Activate the conda environment
 source /mpcdf/soft/SLE_15/packages/x86_64/anaconda/3/2023.03/etc/profile.d/conda.sh
+conda activate cephclr
 
 srun bash run_all.sh "$@"
