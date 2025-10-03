@@ -1,1 +1,1 @@
-configs/default.yaml
+configs/memory_optimized.yaml

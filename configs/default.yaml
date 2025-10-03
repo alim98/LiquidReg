@@ -20,13 +20,13 @@ data:
   val_pairs:   "data/OASIS_val/pairs_val.csv"
   test_pairs:  "data/OASIS_test/pairs_test.csv"
 
-  batch_size: 2
+  batch_size: 1
   num_workers: 8
   pin_memory: true
 
-  patch_size: 64
-  patch_stride: 32
-  patches_per_pair: 32
+  patch_size: 16
+  patch_stride: 8
+  patches_per_pair: 8
 
   use_augmentation: true
   augmentation_prob: 0.8

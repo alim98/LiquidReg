@@ -31,9 +31,9 @@ L2R_DIR="data/gen_L2R"
 IXI_DIR="data/gen_IXI_eval"   # created by setup_data.sh
 
 # Setup
-ENV_NAME="LiquidReg_env"
+ENV_NAME="LiquidReg_env2"
 PYTHON_VERSION="3.12.11"
-SKIP_SETUP=${SKIP_SETUP:-0}   # set SKIP_SETUP=1 to skip conda/pip setup
+SKIP_SETUP=1  # set SKIP_SETUP=1 to skip conda/pip setup
 
 # ---- helpers ----
 log(){ echo "[$(date +'%H:%M:%S')] $*"; }
@@ -42,16 +42,17 @@ need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1"; exit 1; }; }
 need python
 need bash
 need grep
+if [ "${SKIP_SETUP:-1}" -eq 0 ]; then
 need conda
+fi
 need find
 need awk
 need sed
 
 # ---- 0) Data setup (idempotent) ----
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
-
 if [ "$SKIP_SETUP" -eq 0 ]; then
+    source "$(conda info --base)/etc/profile.d/conda.sh"
     echo "[SETUP] Checking Conda environment..."
 
     if ! conda env list | grep -q "$ENV_NAME"; then
@@ -68,8 +69,7 @@ if [ "$SKIP_SETUP" -eq 0 ]; then
     pip install --upgrade pip
     pip install -r requirements.txt
 else
-    echo "[SKIP] Skipping conda & pip setup (SKIP_SETUP=1)"
-    conda activate $ENV_NAME
+    echo "[SKIP] Skipping conda & pip setup (SKIP_SETUP=1); using current environment/modules"
 fi
 
 log "Running setup_data.sh ..."
@@ -174,15 +174,10 @@ print(torch.cuda.device_count() if torch.cuda.is_available() else 0)
 PY
 )
 
-if [ "${NUM_GPUS}" -ge 2 ]; then
-  log "[DDP] ${NUM_GPUS} GPUs detected -> using torchrun"
-  LAUNCHER="torchrun --standalone --nproc_per_node=${NUM_GPUS}"
-  DDP_FLAG="--ddp"
-else
-  log "[DDP] ${NUM_GPUS} GPU(s) detected -> using python"
-  LAUNCHER="python -u"
-  DDP_FLAG=""
-fi
+# Force single-GPU mode to avoid broken PyTorch module distributed components
+log "[DDP] ${NUM_GPUS} GPU(s) detected -> forcing single-GPU mode (module distributed broken)"
+LAUNCHER="python -u"
+DDP_FLAG=""
 
 # ---- 4) Define how to train/infer ----
 TRAIN_CMD(){ # args: config workdir seed
