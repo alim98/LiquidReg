@@ -38,14 +38,14 @@ data:
 # -------- Training --------
 training:
   num_epochs: 300
-  learning_rate: 2.0e-4
-  weight_decay: 1.0e-4
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-5
   optimizer: "adamw"            # "adam", "adamw", "sgd"
   scheduler: "cosine"           # "cosine", "step", "plateau"
 
   # Loss weights
   lambda_similarity: 1.0
-  lambda_jacobian: 0.5
+  lambda_jacobian: 0.05
   lambda_velocity: 0.01
   lambda_liquid: 0.001
 
@@ -53,7 +53,7 @@ training:
   lncc_window: 9
   jacobian_penalty: "l2"        # "l2", "log"
 
-  grad_clip_norm: 1.0
+  grad_clip_norm: 5.0
   use_amp: true
 
   early_stopping_patience: 30

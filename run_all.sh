@@ -13,7 +13,7 @@ SEEDS=( 1 )                   # seeds for multiple runs
 PAIRS_K=5                     # partners per subject in each CSV
 PAIRS_SEED=123                # deterministic sampling for pairs
 CONFIG_LIST_FILE="configs/cfgs_to_run.txt"  # optional list of configs to run
-REMAKE_PAIRS=0
+REMAKE_PAIRS=1
 
 MAX_PAIRS_OASIS_TEST=100
 MAX_PAIRS_OASIS_TRAIN=1000
@@ -251,7 +251,6 @@ FIND_BEST_CKPT(){ # arg: workdir
   fi
 
 }
-
 
 # ensure batch evaluator exists
 if [[ ! -f scripts/eval_pairs.py ]]; then

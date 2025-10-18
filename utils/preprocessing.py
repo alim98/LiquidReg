@@ -100,7 +100,8 @@ def resample_volume(
 
     kwargs = dict(size=target_shape, mode=mode)
     if mode in {"linear", "bilinear", "bicubic", "trilinear"}:
-        kwargs["align_corners"] = False  # pick a policy; stay consistent
+        # kwargs["align_corners"] = False  # pick a policy; stay consistent
+        kwargs["align_corners"] = True   # match model warper (align_corners=True)
 
     resampled = F.interpolate(volume, **kwargs)
 
@@ -267,7 +268,7 @@ def apply_augmentation(
         grid = F.affine_grid(
             affine_3x4.unsqueeze(0),
             (1, C, D, H, W),
-            align_corners=False
+            align_corners=True
         )
         
         # Apply transformation
@@ -276,7 +277,7 @@ def apply_augmentation(
             grid,
             mode='bilinear',
             padding_mode='border',
-            align_corners=False
+            align_corners=True
         )
         
         aug_moving[b:b+1] = F.grid_sample(
@@ -284,7 +285,7 @@ def apply_augmentation(
             grid,
             mode='bilinear',
             padding_mode='border',
-            align_corners=False
+            align_corners=True
         )
     
     # Add noise
