@@ -53,13 +53,8 @@ def set_seed(seed: int):
 def _select_amp_dtype(device: torch.device):
     if device.type != "cuda":
         return None
-    try:
-        major, minor = torch.cuda.get_device_capability(device)
-        if major >= 8:  # Ampere+
-            _ = torch.zeros(1, device=device, dtype=torch.bfloat16)
-            return torch.bfloat16
-    except Exception:
-        pass
+    # Force float16 for compatibility with CUDA 11.6
+    # (bfloat16 is not supported for grid_sample in older CUDA versions)
     return torch.float16
 
 def load_config(config_path: str) -> dict:
@@ -1204,7 +1199,7 @@ def main():
             from torch.amp import GradScaler as AmpGradScaler
         except Exception:
             from torch.cuda.amp import GradScaler as AmpGradScaler
-        scaler = AmpGradScaler(device="cuda", enabled=(use_amp and amp_dtype is torch.float16))
+        scaler = AmpGradScaler(enabled=(use_amp and amp_dtype is torch.float16))
     else:
         # For CPU or when AMP is disabled, create a dummy scaler
         class DummyScaler:

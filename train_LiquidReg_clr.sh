@@ -41,4 +41,7 @@ export PYTHONNOUSERSITE=1
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 export CUDA_LAUNCH_BLOCKING=1
 
+# Fix scipy/GCC library compatibility
+export LD_LIBRARY_PATH=/mpcdf/soft/SLE_15/packages/x86_64/gcc/12.2.0/lib64:$LD_LIBRARY_PATH
+
 srun -n 1 bash run_all.sh "$@"
