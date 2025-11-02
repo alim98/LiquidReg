@@ -106,8 +106,17 @@ class RegPairsDataset(Dataset):
         if raw_key in self._cache:
             raw = self._cache.pop(raw_key); self._cache[raw_key] = raw
         else:
+            # nii = nib.load(str(path))
+            # raw = nii.get_fdata()
+            
             nii = nib.load(str(path))
+            # Reorient to canonical RAS to ensure consistent axes
+            try:
+                nii = nib.as_closest_canonical(nii)
+            except Exception:
+                pass
             raw = nii.get_fdata()
+                        
             # store spacings (sz, sy, sx) on the side for this path
             try:
                 zooms = tuple(map(float, nii.header.get_zooms()[:3]))
@@ -172,7 +181,8 @@ class RegPairsDataset(Dataset):
         # Brain-coverage filter (same as OASIS)
         def _is_valid(p: torch.Tensor, frac: float = 0.10, thresh: float = 0.15) -> bool:
             if p.dtype.is_floating_point:
-                return (p > thresh).float().mean().item() > frac
+                pm = p.float()
+                return (pm.std().item() > 0.05) or (pm.abs().mean().item() > 0.02)
             else:
                 return (p > 0).float().mean().item() > frac
 

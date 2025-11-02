@@ -130,7 +130,8 @@ def create_scheduler(optimizer: optim.Optimizer, config: dict):
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=train_config['num_epochs'],
-            eta_min=1e-6
+            # eta_min=1e-6
+            eta_min=1e-5
         )
     elif train_config['scheduler'] == 'step':
         scheduler = optim.lr_scheduler.StepLR(
@@ -523,6 +524,7 @@ def train_epoch(
 
                 if has_nan_grad:
                     optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
                     new_scale = float(getattr(scaler, "get_scale", lambda: 1.0)())
                 else:
                     scaler.step(optimizer)
@@ -1261,9 +1263,10 @@ def main():
                 if k != 'avg_loss':
                     writer.add_scalar(f'val/epoch_{k}', v, epoch)
             
-            # Check for improvement
-            current_loss = val_losses['avg_loss']
-            is_best = current_loss < best_loss
+            min_delta = float(config['training'].get('early_stopping_delta', 0.0))
+            mon = 'similarity' if 'similarity' in val_losses else 'avg_loss'
+            current_loss = val_losses[mon]
+            is_best = current_loss < (best_loss - min_delta)
             
             if is_best:
                 best_loss = current_loss
@@ -1290,11 +1293,12 @@ def main():
                 break
         
         # Update scheduler
-        if scheduler:
-            if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_losses['avg_loss'] if 'val_losses' in locals() else train_losses['avg_loss'])
-            else:
-                scheduler.step()
+        if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+            mon = 'similarity' if 'val_losses' in locals() and 'similarity' in val_losses else 'avg_loss'
+            scheduler.step(val_losses[mon] if 'val_losses' in locals() else train_losses['avg_loss'])
+        else:
+            scheduler.step()
+
         
         # Log learning rate again (post-step)
         current_lr = optimizer.param_groups[0]['lr']

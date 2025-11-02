@@ -168,6 +168,7 @@ class SimpleCNN3DEncoder(nn.Module):
                 nn.BatchNorm3d(next_channels),
                 nn.ReLU(inplace=True),
             ])
+
             current_channels = next_channels
         
         self.encoder = nn.Sequential(*layers)

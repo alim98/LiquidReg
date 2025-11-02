@@ -244,11 +244,17 @@ class LiquidODECore(nn.Module):
                 h, v = self.cell(h, coords, dt=self.dt)
                 
                 # Check for NaNs and extreme values, then fix them
+                # h = torch.nan_to_num(h, nan=0.0)
+                # v = torch.nan_to_num(v, nan=0.0)
+                # h = torch.clamp(h, -100, 100)
+                # v = torch.clamp(v, -100, 100)
+                
                 h = torch.nan_to_num(h, nan=0.0)
                 v = torch.nan_to_num(v, nan=0.0)
-                h = torch.clamp(h, -100, 100)
-                v = torch.clamp(v, -100, 100)
-                
+                _soft = 50.0
+                h = _soft * torch.tanh(h / _soft)
+                v = _soft * torch.tanh(v / _soft)
+
                 velocities.append(v)
             except Exception as e:
                 print(f"[ERROR] Exception in liquid dynamics step {step}: {e}")
