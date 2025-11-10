@@ -401,6 +401,12 @@ def train_epoch(
     dropped_batches = 0
     max_dropped = max(5, int(0.2 * num_batches))  # e.g., 20% or at least 5
 
+    warmup_epochs = config['training'].get('regularization_warmup_epochs', 25)
+    base_lambda_jacobian = config['training']['lambda_jacobian']
+    lambda_jacobian_effective = base_lambda_jacobian * min(1.0, epoch / warmup_epochs)
+    original_lambda_jacobian = criterion.lambda_jacobian
+    criterion.lambda_jacobian = lambda_jacobian_effective
+
     start_time_epoch = time.time()
 
     pbar = tqdm(total=num_batches, desc=f"Epoch {epoch}")
@@ -532,6 +538,18 @@ def train_epoch(
                     new_scale = float(getattr(scaler, "get_scale", lambda: 1.0)())
             else:
                 loss.backward()
+                
+                if batch_idx == 0 and epoch % 10 == 0:
+                    base_model = model.module if hasattr(model, 'module') else model
+                    if hasattr(base_model, 'hyper_net'):
+                        for name, p in base_model.hyper_net.named_parameters():
+                            if p.grad is not None:
+                                g_mean = float(p.grad.abs().mean())
+                                if g_mean > 0:
+                                    print(f"[GradCheck] hyper_net.{name}: grad_mean={g_mean:.6f}")
+                                    writer.add_scalar(f'gradcheck/hyper_net_{name}_mean', g_mean, step)
+                                    break
+                
                 if config['training']['grad_clip_norm'] > 0.0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(),
@@ -642,6 +660,9 @@ def train_epoch(
     # Average losses
     avg_losses = {key: value / num_batches for key, value in total_losses.items()} if num_batches > 0 else {}
     avg_losses['avg_loss'] = total_loss / num_batches if num_batches > 0 else float('inf')
+    
+    criterion.lambda_jacobian = original_lambda_jacobian
+    writer.add_scalar('train/lambda_jacobian_effective', lambda_jacobian_effective, epoch)
     
     return avg_losses
 

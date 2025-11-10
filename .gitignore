@@ -7,3 +7,7 @@ data/*
 *.tar
 *.csv
 *.pth
+runs2/*
+gradient_test_output.log
+test_gradient_fix.sh
+experiments/*

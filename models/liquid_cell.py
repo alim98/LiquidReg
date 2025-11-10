@@ -140,6 +140,52 @@ class LiquidCell3D(nn.Module):
             # Return zeros if exception occurs
             return torch.zeros_like(h), torch.zeros(h.shape[0], h.shape[1], 3, device=h.device, dtype=h.dtype)
     
+    def _unpack(self, params: torch.Tensor):
+        if params.dim() > 1:
+            params = params[0]
+        idx = 0
+        def take(n):
+            nonlocal idx
+            out = params[idx:idx+n]
+            idx += n
+            return out
+
+        n_Wh = self.hidden_dim * self.hidden_dim
+        n_Uh = self.hidden_dim * self.input_dim
+        n_bh = self.hidden_dim
+        n_Wt = self.hidden_dim * self.hidden_dim
+        n_Ut = self.hidden_dim * self.input_dim
+        n_bt = self.hidden_dim
+        n_Wo = 3 * self.hidden_dim
+        n_bo = 3
+
+        W_h = take(n_Wh).view(self.hidden_dim, self.hidden_dim)
+        U_h = take(n_Uh).view(self.hidden_dim, self.input_dim)
+        b_h = take(n_bh)
+
+        W_tau = take(n_Wt).view(self.hidden_dim, self.hidden_dim)
+        U_tau = take(n_Ut).view(self.hidden_dim, self.input_dim)
+        b_tau = take(n_bt)
+
+        W_out = take(n_Wo).view(3, self.hidden_dim)
+        b_out = take(n_bo)
+
+        return W_h, U_h, b_h, W_tau, U_tau, b_tau, W_out, b_out
+
+    def forward_functional(self, h: torch.Tensor, u: torch.Tensor, params: torch.Tensor, dt: float = 0.1):
+        W_h, U_h, b_h, W_tau, U_tau, b_tau, W_out, b_out = self._unpack(torch.tanh(params * 0.1))
+        tau_raw = h @ W_tau.T + u @ U_tau.T + b_tau
+        tau = self.min_tau + torch.nn.functional.softplus(tau_raw) * (self.max_tau - self.min_tau)
+        tau = torch.clamp(tau, min=1e-6)
+        pre = h @ W_h.T + u @ U_h.T + b_h
+        f_h = torch.sigmoid(pre)
+        h_dot = -h / tau + f_h
+        h_new = h + dt * h_dot
+        h_new = torch.nan_to_num(h_new, nan=0.0)
+        v_pre = h_new @ W_out.T + b_out
+        v = torch.tanh(v_pre)
+        return h_new, v
+
     def set_params_from_vector(self, params: torch.Tensor):
         """
         Set all parameters from a flat parameter vector.
@@ -230,10 +276,6 @@ class LiquidODECore(nn.Module):
         # Reshape spatial coordinates
         coords = spatial_coords.view(B, N, 3)
         
-        # Set parameters if provided
-        if params is not None:
-            self.cell.set_params_from_vector(params)
-        
         # Initialize hidden state
         h = torch.zeros(B, N, self.hidden_dim, device=coords.device, dtype=coords.dtype)
         
@@ -241,13 +283,7 @@ class LiquidODECore(nn.Module):
         velocities = []
         for step in range(self.num_steps):
             try:
-                h, v = self.cell(h, coords, dt=self.dt)
-                
-                # Check for NaNs and extreme values, then fix them
-                # h = torch.nan_to_num(h, nan=0.0)
-                # v = torch.nan_to_num(v, nan=0.0)
-                # h = torch.clamp(h, -100, 100)
-                # v = torch.clamp(v, -100, 100)
+                h, v = self.cell.forward_functional(h, coords, params, dt=self.dt)
                 
                 h = torch.nan_to_num(h, nan=0.0)
                 v = torch.nan_to_num(v, nan=0.0)
