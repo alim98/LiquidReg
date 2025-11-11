@@ -1,0 +1,95 @@
+# =========================
+# LiquidReg 4-GPU DDP Config
+# =========================
+
+# -------- Model --------
+model:
+  name: "LiquidReg"
+  image_size: [112, 112, 112]
+  encoder_type: "cnn"
+  encoder_channels: 192
+  liquid_hidden_dim: 48
+  liquid_num_steps: 8
+  velocity_scale: 1.0
+  num_squaring: 6
+  fusion_type: "concat_pool"
+
+# -------- Data (pairs-CSV) --------
+data:
+  train_pairs: "data/OASIS_train/pairs_train.csv"
+  val_pairs:   "data/OASIS_val/pairs_val.csv"
+  test_pairs:  "data/OASIS_test/pairs_test.csv"
+
+  batch_size: 2
+  num_workers: 8
+  pin_memory: true
+
+  patch_size: 24
+  patch_stride: 12
+  patches_per_pair: 12
+
+  use_augmentation: true
+  augmentation_prob: 0.8
+
+  use_labels_train: true
+  use_labels_val:   true
+  image_size: [112, 112, 112]
+
+# -------- Training --------
+training:
+  num_epochs: 300
+  learning_rate: 2.5e-4
+  weight_decay: 1.0e-4
+  optimizer: "adamw"
+  scheduler: "cosine"
+
+  # Loss weights
+  lambda_similarity: 1.0
+  lambda_jacobian: 0.1
+  lambda_velocity: 0.01
+  lambda_liquid: 0.001
+
+  similarity_loss: "lncc"
+  lncc_window: 9
+  jacobian_penalty: "l2"
+
+  grad_clip_norm: 1.0
+  use_amp: true
+
+  early_stopping_patience: 30
+  early_stopping_delta: 1.0e-4
+
+# -------- Validation --------
+validation:
+  eval_interval: 1
+  save_best: true
+  save_last: true
+  compute_metrics: true
+
+# -------- Logging --------
+logging:
+  log_dir: "runs"
+  experiment_name: "liquidreg_4gpu"
+  log_interval: 50
+  save_interval: 25
+  wandb: false
+  tensorboard: true
+
+# -------- Hardware --------
+device:
+  gpu_ids: [0, 1, 2, 3]
+  mixed_precision: true
+  compile_model: false
+
+# -------- Repro --------
+seed: 42
+deterministic: true
+
+# -------- Metrics / Viz --------
+metrics:
+  compute_dice: true
+  compute_jacobian_stats: true
+  compute_deformation_magnitude: true
+  save_visualizations: true
+  num_vis_samples: 5
+

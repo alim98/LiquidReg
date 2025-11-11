@@ -3,7 +3,7 @@
 #SBATCH -o ./slurm/output_liquid/%j.out
 #SBATCH -J liquid_training
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=18
 #SBATCH --mem=300000
 #SBATCH --constraint=gpu
@@ -11,17 +11,17 @@
 #SBATCH --time=24:00:00
 #SBATCH --mail-user=your_email@domain
 module purge
-# Compiler and Python stack required to expose ML modules
-module load gcc/12 anaconda/3/2023.03
+module load anaconda/3/2023.03
+module load cuda/11.6
+module load gcc/11
+module load openmpi_gpu/4.1
 
 # Activate your conda environment first
 source /mpcdf/soft/SLE_15/packages/x86_64/anaconda/3/2023.03/etc/profile.d/conda.sh
 conda activate LiquidReg_env2
 
-# Then load CUDA 11.6 + cuDNN (cudnn 8.x) and PyTorch module matching it
-module load cuda/11.6 || module load cuda/11.6.2 || module load cuda
-module load cudnn/8.9.2 || module load cudnn/8.8.1 || true
-module load pytorch/gpu-cuda-11.6/2.1.0 || module load pytorch/gpu-cuda-11.6/2.0.0 || true
+# Load PyTorch distributed module (must load after anaconda)
+module load pytorch-distributed/gpu-cuda-11.6/2.1.0
 
 # Quick sanity check
 python - <<'PY'
@@ -44,4 +44,6 @@ export CUDA_LAUNCH_BLOCKING=1
 # Fix scipy/GCC library compatibility
 export LD_LIBRARY_PATH=/mpcdf/soft/SLE_15/packages/x86_64/gcc/12.2.0/lib64:$LD_LIBRARY_PATH
 
-srun -n 1 bash run_all.sh "$@"
+NP=${SLURM_NTASKS_PER_NODE:-4}
+echo "Running with $NP GPUs using torch.distributed.run"
+python -m torch.distributed.run --standalone --nproc_per_node="$NP" scripts/train.py "$@"

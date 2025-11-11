@@ -1151,9 +1151,12 @@ def main():
     
     # model.to(device)
     if is_ddp:
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        if is_main_process():
+            print("[DDP] Converted BatchNorm to SyncBatchNorm")
         model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None,
                     output_device=local_rank if device.type == "cuda" else None,
-                    find_unused_parameters=False)
+                    find_unused_parameters=True)
 
     
     # Try to log the model graph (best-effort)
