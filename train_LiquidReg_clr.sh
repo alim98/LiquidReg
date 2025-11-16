@@ -8,8 +8,8 @@
 #SBATCH --mem=300000
 #SBATCH --constraint=gpu
 #SBATCH --gres=gpu:a100:4
-#SBATCH --time=24:00:00
-#SBATCH --mail-user=your_email@domain
+#SBATCH --time=1:00:00
+#SBATCH --mail-user=ali.mikaeili@brain.mpg.de
 module purge
 module load anaconda/3/2023.03
 module load cuda/11.6

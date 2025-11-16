@@ -82,8 +82,8 @@ class RegPairsDataset(Dataset):
         self.augmentor = PatchAugmentor() if self.augment else None
         
         from collections import OrderedDict
-        self._cache = OrderedDict()   # key -> np.ndarray
-        self._cache_max = 32          # tune to your RAM
+        self._cache = OrderedDict()
+        self._cache_max = 4
 
 
     def __len__(self) -> int:

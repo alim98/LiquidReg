@@ -9,9 +9,12 @@ import sys
 import argparse
 import yaml
 import time
+import signal
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import GradScaler, autocast
 import numpy as np
@@ -25,7 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from utils.ddp import init_distributed, is_main_process, barrier, cleanup, reduce_mean, get_rank, get_world_size
+from utils.ddp import init_distributed, is_main_process, barrier, cleanup, reduce_mean, get_rank, get_world_size, is_distributed
 from models.liquidreg import LiquidReg, LiquidRegLite
 from dataloaders.oasis_dataset import create_oasis_loaders
 from losses.registration_losses import CompositeLoss
@@ -389,7 +392,9 @@ def train_epoch(
     config: dict,
     epoch: int,
     writer: SummaryWriter,
-    fail_fast = False
+    fail_fast = False,
+    checkpoint_callback = None,
+    start_step_in_epoch: int = 0
 ) -> dict:
     """Train for one epoch."""
     model.train()
@@ -409,9 +414,20 @@ def train_epoch(
 
     start_time_epoch = time.time()
 
-    pbar = tqdm(total=num_batches, desc=f"Epoch {epoch}")
+    is_main = not dist.is_initialized() or dist.get_rank() == 0
+    pbar = tqdm(total=num_batches, desc=f"Epoch {epoch}", disable=not is_main)
     it = iter(train_loader)
-    batch_idx = 0
+    batch_idx = start_step_in_epoch
+    
+    if start_step_in_epoch > 0:
+        print(f"Resuming from step {start_step_in_epoch}/{num_batches} in epoch {epoch}")
+        for _ in range(start_step_in_epoch):
+            try:
+                next(it)
+            except StopIteration:
+                break
+        pbar.update(start_step_in_epoch)
+    
     while batch_idx < num_batches:
         iter_start = time.time()
         try:
@@ -644,6 +660,12 @@ def train_epoch(
 
             # Param/grad histograms occasionally
             _log_param_and_grad_hists(writer, model, step, every_n=max(1, 10 * config['logging']['log_interval']))
+        
+        # Step-wise checkpoint saving
+        if checkpoint_callback is not None:
+            save_interval_steps = config['logging'].get('save_interval_steps', 0)
+            if save_interval_steps > 0 and (batch_idx + 1) % save_interval_steps == 0:
+                checkpoint_callback(epoch, batch_idx + 1, loss.item())
     
         batch_idx += 1
         pbar.update(1)
@@ -689,8 +711,10 @@ def validate_epoch(
     max_dropped = max(5, int(0.2 * num_batches))  # e.g., 20% or at least 5
 
     
+    is_main = not dist.is_initialized() or dist.get_rank() == 0
+    
     with torch.no_grad():
-        pbar = tqdm(total=num_batches, desc=f"Validation {epoch}")
+        pbar = tqdm(total=num_batches, desc=f"Validation {epoch}", disable=not is_main)
         it = iter(val_loader)
         batch_idx = 0
         while batch_idx < num_batches:
@@ -823,8 +847,10 @@ def validate_epoch(
             
             pbar.set_postfix({'val_loss': f"{loss.item():.4f}"})
 
-            # Per-batch val logging
-            if batch_idx % max(1, config['logging']['log_interval']) == 0:
+            # Per-batch val logging (only on rank 0, less frequently to save memory)
+            is_main = not dist.is_initialized() or dist.get_rank() == 0
+            val_log_interval = max(10, config['logging']['log_interval'] * 2)
+            if is_main and batch_idx % val_log_interval == 0:
                 step = epoch * num_batches + batch_idx
                 writer.add_scalar('val/step_loss', reduce_mean(loss.detach()).item(), step)
                 _add_images(writer, "val/images", fixed, moving, warped, step,
@@ -839,27 +865,53 @@ def validate_epoch(
             batch_idx += 1
             pbar.update(1)
     
-    # Average losses
+    barrier()
+    
+    if dist.is_initialized():
+        device = next(model.parameters()).device
+        total_loss_tensor = torch.tensor(total_loss, device=device)
+        dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
+        total_loss = total_loss_tensor.item() / get_world_size()
+        
+        for key in total_losses:
+            val_tensor = torch.tensor(total_losses[key], device=device)
+            dist.all_reduce(val_tensor, op=dist.ReduceOp.SUM)
+            total_losses[key] = val_tensor.item() / get_world_size()
+        
+        total_batches_tensor = torch.tensor(num_batches, device=device)
+        dist.all_reduce(total_batches_tensor, op=dist.ReduceOp.SUM)
+        num_batches = total_batches_tensor.item()
+    
     avg_losses = {key: value / num_batches for key, value in total_losses.items()} if num_batches > 0 else {}
     avg_losses['avg_loss'] = total_loss / num_batches if num_batches > 0 else float('inf')
     
-    # Log to tensorboard
-    writer.add_scalar('val/loss', avg_losses['avg_loss'], epoch)
-    for key, value in avg_losses.items():
-        if key != 'avg_loss':
-            writer.add_scalar(f'val/{key}', value, epoch)
+    is_main = not dist.is_initialized() or dist.get_rank() == 0
+    if is_main:
+        writer.add_scalar('val/loss', avg_losses['avg_loss'], epoch)
+        for key, value in avg_losses.items():
+            if key != 'avg_loss':
+                writer.add_scalar(f'val/{key}', value, epoch)
 
     # --- one full-slice-style preview from the last seen batch (best-effort) ---
-    try:
-        writer.add_text('val/preview_note', 'Preview uses first item of a validation batch', epoch)
-        _add_images(writer, "val/preview_fullslice_like", fixed[:1], moving[:1], warped[:1],
-                    step=epoch, plane="axial", out_hw=512, grid_slices=0)
-        _add_images(writer, "val/preview_fullslice_like", fixed[:1], moving[:1], warped[:1],
-                    step=epoch, plane="sag", out_hw=512, grid_slices=0)
-        _add_images(writer, "val/preview_fullslice_like", fixed[:1], moving[:1], warped[:1],
-                    step=epoch, plane="cor", out_hw=512, grid_slices=0)
-    except Exception:
-        pass
+    # Only save visualizations on rank 0 to avoid OOM in DDP
+    is_main = not dist.is_initialized() or dist.get_rank() == 0
+    if is_main:
+        try:
+            writer.add_text('val/preview_note', 'Preview uses first item of a validation batch', epoch)
+            _add_images(writer, "val/preview_fullslice_like", fixed[:1], moving[:1], warped[:1],
+                        step=epoch, plane="axial", out_hw=512, grid_slices=0)
+            _add_images(writer, "val/preview_fullslice_like", fixed[:1], moving[:1], warped[:1],
+                        step=epoch, plane="sag", out_hw=512, grid_slices=0)
+            _add_images(writer, "val/preview_fullslice_like", fixed[:1], moving[:1], warped[:1],
+                        step=epoch, plane="cor", out_hw=512, grid_slices=0)
+        except Exception:
+            pass
+    
+    # Clear references to avoid OOM
+    if 'fixed' in locals():
+        del fixed, moving, warped
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     return avg_losses
 
@@ -873,7 +925,8 @@ def save_checkpoint(
     config: dict,
     filepath: str,
     is_best: bool = False,
-    writer: SummaryWriter = None
+    writer: SummaryWriter = None,
+    step_in_epoch: int = None
 ):
     """Save model checkpoint."""
     base = model.module if hasattr(model, "module") else model
@@ -884,6 +937,9 @@ def save_checkpoint(
         'loss': loss,
         'config': config,
     }
+    
+    if step_in_epoch is not None:
+        checkpoint['step_in_epoch'] = step_in_epoch
     
     if scheduler is not None:
         checkpoint['scheduler_state_dict'] = scheduler.state_dict()
@@ -1173,24 +1229,15 @@ def main():
     # Enable gradient checkpointing if requested (DDP-safe)
     if args.gradient_checkpointing:
         print("Enabling gradient checkpointing to save memory")
-        _m = model.module if hasattr(model, "module") else model  # <- use the base module
-
-        # Encoder (if it supports HF-style GC)
-        if hasattr(_m, 'encoder') and hasattr(_m.encoder, 'encoder'):
+        _m = model.module if hasattr(model, "module") else model
+        if hasattr(_m, "encoder") and hasattr(_m.encoder, "encoder") and hasattr(_m.encoder.encoder, "gradient_checkpointing_enable"):
             _m.encoder.encoder.gradient_checkpointing_enable()
             print("Gradient checkpointing enabled for encoder")
-
-        # Liquid core: wrap its forward with torch.utils.checkpoint
-        if hasattr(_m, 'liquid_core'):
+        if hasattr(_m, "liquid_core"):
             import torch.utils.checkpoint as cp
-            original_forward = _m.liquid_core.forward  # bound method on the base module
-
+            original_forward = _m.liquid_core.forward
             def checkpointed_forward(self, coords, params):
-                # Keep signature; wrap compute in checkpoint
-                return cp.checkpoint(lambda c, p: original_forward(c, p),
-                                    coords, params,
-                                    preserve_rng_state=True)
-
+                return cp.checkpoint(lambda c, p: original_forward(c, p), coords, params, preserve_rng_state=True)
             _m.liquid_core.forward = types.MethodType(checkpointed_forward, _m.liquid_core)
             print("Gradient checkpointing enabled for liquid_core")
 
@@ -1240,6 +1287,7 @@ def main():
     # Training loop
     early_stopping_counter = 0    
     start_epoch = 0
+    start_step_in_epoch = 0
     best_loss = float('inf')
 
     if args.resume:
@@ -1249,13 +1297,56 @@ def main():
         if 'scheduler_state_dict' in ckpt and scheduler is not None:
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         if 'epoch' in ckpt:
-            start_epoch = int(ckpt['epoch']) + 1
+            start_epoch = int(ckpt['epoch'])
+            if 'step_in_epoch' in ckpt and ckpt['step_in_epoch'] is not None:
+                start_step_in_epoch = int(ckpt['step_in_epoch'])
+                print(f"Resumed from mid-epoch checkpoint: epoch={start_epoch}, step={start_step_in_epoch}")
+            else:
+                start_epoch += 1
+                start_step_in_epoch = 0
         if 'loss' in ckpt:
-            best_loss = float(ckpt['loss'])  # treat stored loss as current best
-        print(f"Resumed from {args.resume} (start_epoch={start_epoch}, best_loss={best_loss:.4f})")
+            best_loss = float(ckpt['loss'])
+        print(f"Resumed from {args.resume} (start_epoch={start_epoch}, start_step={start_step_in_epoch}, best_loss={best_loss:.4f})")
 
+    # Setup signal handler for graceful shutdown
+    interrupted = False
+    current_epoch = [start_epoch]
+    current_step = [start_step_in_epoch]
+    
+    def signal_handler(signum, frame):
+        nonlocal interrupted
+        print(f"\n[WARNING] Received signal {signum}. Saving emergency checkpoint...")
+        interrupted = True
+        if main_process:
+            emergency_path = checkpoint_dir / f'emergency_epoch_{current_epoch[0]}_step_{current_step[0]}.pth'
+            save_checkpoint(
+                model, optimizer, scheduler, current_epoch[0], best_loss,
+                config, str(emergency_path), False, writer,
+                step_in_epoch=current_step[0]
+            )
+            print(f"Emergency checkpoint saved to {emergency_path}")
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Checkpoint callback for step-wise saving
+    def checkpoint_callback(epoch, step, loss):
+        if main_process:
+            ckpt_path = checkpoint_dir / f'epoch_{epoch}_step_{step}.pth'
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, loss,
+                config, str(ckpt_path), False, writer,
+                step_in_epoch=step
+            )
+            print(f"\n[Checkpoint] Saved at epoch {epoch}, step {step}/{len(train_loader)}")
+            current_step[0] = step
     
     for epoch in range(start_epoch, config['training']['num_epochs']):
+        current_epoch[0] = epoch
+        
+        if interrupted:
+            print("Training interrupted by signal. Exiting gracefully...")
+            break
         
         if is_ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -1263,9 +1354,15 @@ def main():
         print(f"\nEpoch {epoch}/{config['training']['num_epochs']}")
         writer.add_scalar('train/learning_rate', optimizer.param_groups[0]['lr'], epoch)
         
+        # Determine starting step for this epoch
+        step_start = start_step_in_epoch if epoch == start_epoch else 0
+        current_step[0] = step_start
+        
         # Train
         train_losses = train_epoch(
-            model, train_loader, criterion, optimizer, scaler, config, epoch, writer,FAIL_FAST
+            model, train_loader, criterion, optimizer, scaler, config, epoch, writer, FAIL_FAST,
+            checkpoint_callback=checkpoint_callback,
+            start_step_in_epoch=step_start
         )
         
         print(f"Train Loss: {train_losses['avg_loss']:.4f}")
@@ -1281,6 +1378,8 @@ def main():
                 model, val_loader, criterion, config, epoch, writer,FAIL_FAST
             )
             
+            barrier()
+            
             print(f"Val Loss: {val_losses['avg_loss']:.4f}")
             writer.add_scalar('val/epoch_loss', val_losses['avg_loss'], epoch)
             for k, v in val_losses.items():
@@ -1289,7 +1388,10 @@ def main():
             
             min_delta = float(config['training'].get('early_stopping_delta', 0.0))
             mon = 'similarity' if 'similarity' in val_losses else 'avg_loss'
-            current_loss = val_losses[mon]
+            current_loss = float(val_losses[mon])
+            if not math.isfinite(current_loss) or abs(current_loss) > 1e6:
+                print(f"Skipping pathological validation loss value: {current_loss}")
+                current_loss = best_loss
             is_best = current_loss < (best_loss - min_delta)
             
             if is_best:
@@ -1301,13 +1403,15 @@ def main():
                 early_stopping_counter += 1
                 writer.add_scalar('val/no_improve_streak', early_stopping_counter, epoch)
             
-            # Save checkpoint
+            # Save checkpoint (end of epoch - no step_in_epoch)
             if main_process and (epoch % config['logging']['save_interval'] == 0 or is_best):
                 checkpoint_path = checkpoint_dir / f'epoch_{epoch}.pth'
                 save_checkpoint(
                     model, optimizer, scheduler, epoch, current_loss, 
-                    config, str(checkpoint_path), is_best, writer
+                    config, str(checkpoint_path), is_best, writer,
+                    step_in_epoch=None
                 )
+                current_step[0] = 0
             
             # Early stopping
             if (early_stopping_counter >= config['training']['early_stopping_patience'] and
@@ -1334,7 +1438,8 @@ def main():
         save_checkpoint(
             model, optimizer, scheduler, epoch, 
             val_losses['avg_loss'] if 'val_losses' in locals() else train_losses['avg_loss'], 
-            config, str(final_path), writer=writer
+            config, str(final_path), False, writer,
+            step_in_epoch=None
         )
     
     # writer.close()

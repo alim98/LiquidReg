@@ -20,13 +20,13 @@ data:
   val_pairs:   "data/OASIS_val/pairs_val.csv"
   test_pairs:  "data/OASIS_test/pairs_test.csv"
 
-  batch_size: 2
-  num_workers: 8
+  batch_size: 1
+  num_workers: 4
   pin_memory: true
 
   patch_size: 24
   patch_stride: 12
-  patches_per_pair: 12
+  patches_per_pair: 8
 
   use_augmentation: true
   augmentation_prob: 0.8
@@ -71,7 +71,8 @@ logging:
   log_dir: "runs"
   experiment_name: "liquidreg_4gpu"
   log_interval: 50
-  save_interval: 25
+  save_interval: 1
+  save_interval_steps: 200
   wandb: false
   tensorboard: true
 

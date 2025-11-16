@@ -17,7 +17,16 @@ TRAIN_PAIRS="data/OASIS_train/pairs_train.csv"
 VAL_PAIRS="data/OASIS_val/pairs_val.csv"
 WORK_DIR="runs/liquidreg_4gpu"
 
-TRAIN_ARGS="--config $CONFIG --train_pairs $TRAIN_PAIRS --val_pairs $VAL_PAIRS --work_dir $WORK_DIR --ddp"
+# Check for existing checkpoint before first submission
+LATEST_CKPT=$(find "$WORK_DIR" -name "*.pth" -type f 2>/dev/null | sort -V | tail -1)
+if [[ -n "$LATEST_CKPT" ]]; then
+    echo "Found existing checkpoint: $LATEST_CKPT"
+    echo "Resuming from: $LATEST_CKPT"
+    TRAIN_ARGS="--config $CONFIG --train_pairs $TRAIN_PAIRS --val_pairs $VAL_PAIRS --work_dir $WORK_DIR --ddp --gradient_checkpointing --resume $LATEST_CKPT"
+else
+    echo "No checkpoint found, starting from scratch"
+    TRAIN_ARGS="--config $CONFIG --train_pairs $TRAIN_PAIRS --val_pairs $VAL_PAIRS --work_dir $WORK_DIR --ddp --gradient_checkpointing"
+fi
 
 # First submission
 output=$(sbatch "$job_script" $TRAIN_ARGS)
@@ -47,10 +56,14 @@ while true; do
         echo "Job $job_id ended with $job_status. Restarting..."
         
         # Find latest checkpoint for resume
-        LATEST_CKPT=$(find "$WORK_DIR" -name "*.pth" -type f | grep -E "(best|last|final)" | sort -V | tail -1)
+        LATEST_CKPT=$(find "$WORK_DIR" -name "*.pth" -type f 2>/dev/null | sort -V | tail -1)
         if [[ -n "$LATEST_CKPT" ]]; then
             echo "Resuming from: $LATEST_CKPT"
-            TRAIN_ARGS="$TRAIN_ARGS --resume $LATEST_CKPT"
+            # Reset TRAIN_ARGS to avoid accumulating --resume flags
+            TRAIN_ARGS="--config $CONFIG --train_pairs $TRAIN_PAIRS --val_pairs $VAL_PAIRS --work_dir $WORK_DIR --ddp --gradient_checkpointing --resume $LATEST_CKPT"
+        else
+            echo "No checkpoint found, starting from scratch"
+            TRAIN_ARGS="--config $CONFIG --train_pairs $TRAIN_PAIRS --val_pairs $VAL_PAIRS --work_dir $WORK_DIR --ddp --gradient_checkpointing"
         fi
         
         output=$(sbatch "$job_script" $TRAIN_ARGS)
