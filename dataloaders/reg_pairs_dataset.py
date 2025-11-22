@@ -38,6 +38,15 @@ def _read_pairs_csv(csv_path: Path) -> List[Dict[str, Optional[str]]]:
     return rows
 
 
+def _worker_init_fn(worker_id: int):
+    """Initialize each worker with a unique seed to avoid duplicate randomness."""
+    base_seed = 42
+    worker_seed = base_seed + worker_id
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
+
 class RegPairsDataset(Dataset):
     """
     Path-based registration dataset.
@@ -56,8 +65,6 @@ class RegPairsDataset(Dataset):
         use_labels: bool = False,
         seed: int = 42,
         target_size: Optional[Tuple[int,int,int]] = None,
-        resample_mode_img: str = "trilinear",
-        resample_mode_lbl: str = "nearest",
     ):
         self.csv_path = Path(pairs_csv)
         if not self.csv_path.exists():
@@ -67,14 +74,14 @@ class RegPairsDataset(Dataset):
         if len(self.rows) == 0:
             raise RuntimeError(f"No pairs in CSV: {pairs_csv}")
 
+        assert target_size is not None, "target_size must be provided to ensure fixed and moving images are resampled to the same shape for aligned patch grids"
+
         self.patch_size = patch_size
         self.patch_stride = patch_stride
         self.patches_per_pair = patches_per_pair
         self.augment = augment
         self.use_labels = use_labels
         self.target_size = target_size
-        self.resample_mode_img = resample_mode_img
-        self.resample_mode_lbl = resample_mode_lbl
 
         random.seed(seed)
         np.random.seed(seed)
@@ -83,7 +90,9 @@ class RegPairsDataset(Dataset):
         
         from collections import OrderedDict
         self._cache = OrderedDict()
-        self._cache_max = 4
+        self._cache_max = 32
+        self._patch_cache = OrderedDict()
+        self._patch_cache_max = 64
 
 
     def __len__(self) -> int:
@@ -144,32 +153,42 @@ class RegPairsDataset(Dataset):
             self._cache.popitem(last=False)
         return arr
 
+    def _get_patches_cached(self, volume: torch.Tensor, volume_key: str):
+        if volume_key in self._patch_cache:
+            patches = self._patch_cache.pop(volume_key)
+            self._patch_cache[volume_key] = patches
+            return patches
+        
+        patches, _ = extract_patches(volume, self.patch_size, self.patch_stride)
+        self._patch_cache[volume_key] = patches
+        if len(self._patch_cache) > self._patch_cache_max:
+            self._patch_cache.popitem(last=False)
+        return patches
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row_idx = idx // self.patches_per_pair
+        patch_offset = idx % self.patches_per_pair
         row = self.rows[row_idx]
 
         f_path, m_path = row["fixed"], row["moving"]
         if not f_path or not m_path:
             raise RuntimeError(f"Bad row in {self.csv_path}: {row}")
 
-        # Load full arrays
         f_img = self._load_volume(f_path, is_label=False)
         m_img = self._load_volume(m_path, is_label=False)
 
-        # Convert to torch tensors (C,D,H,W)
         fixed = torch.from_numpy(f_img).unsqueeze(0).float()
         moving = torch.from_numpy(m_img).unsqueeze(0).float()
-        # spacing tensors (sz, sy, sx)
         f_spacing = torch.tensor(self._cache.get(("SPACING", f_path), (1.0, 1.0, 1.0)), dtype=torch.float32)
         m_spacing = torch.tensor(self._cache.get(("SPACING", m_path), (1.0, 1.0, 1.0)), dtype=torch.float32)
 
-        # Normalize
         fixed = normalize_volume(fixed)
         moving = normalize_volume(moving)
 
-        # Extract patches
-        fixed_patches, _ = extract_patches(fixed, self.patch_size, self.patch_stride)
-        moving_patches, _ = extract_patches(moving, self.patch_size, self.patch_stride)
+        f_key = (f_path, self.patch_size, self.patch_stride)
+        m_key = (m_path, self.patch_size, self.patch_stride)
+        fixed_patches = self._get_patches_cached(fixed, f_key)
+        moving_patches = self._get_patches_cached(moving, m_key)
 
         if not fixed_patches or not moving_patches:
             raise RuntimeError("Failed to extract patches from input volumes")
@@ -178,24 +197,30 @@ class RegPairsDataset(Dataset):
         if max_valid_idx < 0:
             raise RuntimeError("No overlapping valid patches between fixed/moving volumes")
 
-        # Brain-coverage filter (same as OASIS)
-        def _is_valid(p: torch.Tensor, frac: float = 0.10, thresh: float = 0.15) -> bool:
+        def _is_valid(p: torch.Tensor) -> bool:
             if p.dtype.is_floating_point:
                 pm = p.float()
-                return (pm.std().item() > 0.05) or (pm.abs().mean().item() > 0.02)
+                p_flat = pm.flatten()
+                if p_flat.numel() == 0:
+                    return False
+                p10 = torch.quantile(p_flat, 0.10).item()
+                p90 = torch.quantile(p_flat, 0.90).item()
+                return (p90 - p10) > 1e-6
             else:
-                return (p > 0).float().mean().item() > frac
+                return (p > 0).float().mean().item() > 0.10
 
-        max_attempts = 20
-        patch_idx = None
-        for _ in range(max_attempts):
-            cand_idx = random.randint(0, max_valid_idx)
-            if _is_valid(fixed_patches[cand_idx]) and _is_valid(moving_patches[cand_idx]):
-                patch_idx = cand_idx
-                break
+        valid_indices = [
+            i for i in range(max_valid_idx + 1)
+            if _is_valid(fixed_patches[i]) and _is_valid(moving_patches[i])
+        ]
+        
+        if not valid_indices:
+            valid_indices = list(range(max_valid_idx + 1))
 
-        if patch_idx is None:
-            patch_idx = random.randint(0, max_valid_idx)
+        if self.augment:
+            patch_idx = random.choice(valid_indices)
+        else:
+            patch_idx = valid_indices[patch_offset % len(valid_indices)]
 
         fixed_patch = fixed_patches[patch_idx]
         moving_patch = moving_patches[patch_idx]
@@ -225,8 +250,10 @@ class RegPairsDataset(Dataset):
                 fseg_t = torch.from_numpy(f_seg).unsqueeze(0).long()
                 mseg_t = torch.from_numpy(m_seg).unsqueeze(0).long()
 
-                fseg_patches, _ = extract_patches(fseg_t, self.patch_size, self.patch_stride)
-                mseg_patches, _ = extract_patches(mseg_t, self.patch_size, self.patch_stride)
+                fseg_key = (row["fixed_seg"], self.patch_size, self.patch_stride)
+                mseg_key = (row["moving_seg"], self.patch_size, self.patch_stride)
+                fseg_patches = self._get_patches_cached(fseg_t, fseg_key)
+                mseg_patches = self._get_patches_cached(mseg_t, mseg_key)
 
                 if (fseg_patches and mseg_patches and
                         patch_idx < len(fseg_patches) and patch_idx < len(mseg_patches)):
@@ -235,65 +262,6 @@ class RegPairsDataset(Dataset):
 
         return out
 
-
-def create_loaders_from_pairs(
-    train_pairs_csv: str,
-    val_pairs_csv: str,
-    test_pairs_csv: Optional[str] = None,
-    batch_size: int = 4,
-    patch_size: int = 64,
-    patch_stride: int = 32,
-    patches_per_pair: int = 20,
-    num_workers: int = 4,
-    use_labels_train: bool = True,
-    use_labels_val: bool = True,
-    target_size: Optional[Tuple[int,int,int]] = None, 
-):
-    train_ds = RegPairsDataset(
-        train_pairs_csv,
-        patch_size=patch_size,
-        patch_stride=patch_stride,
-        patches_per_pair=patches_per_pair,
-        augment=True,
-        use_labels=use_labels_train,
-        target_size=target_size,
-    )
-    val_ds = RegPairsDataset(
-        val_pairs_csv,
-        patch_size=patch_size,
-        patch_stride=patch_stride,
-        patches_per_pair=patches_per_pair,
-        augment=False,
-        use_labels=use_labels_val,
-        target_size=target_size,
-    )
-
-    train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True
-    )
-    val_loader = torch.utils.data.DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
-    )
-
-    test_loader = None
-    if test_pairs_csv:
-        test_ds = RegPairsDataset(
-            test_pairs_csv,
-            patch_size=patch_size,
-            patch_stride=patch_stride,
-            patches_per_pair=patches_per_pair,
-            augment=False,
-            use_labels=False,
-            target_size=target_size,
-        )
-        test_loader = torch.utils.data.DataLoader(
-            test_ds, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, pin_memory=True
-        )
-
-    return train_loader, val_loader, test_loader
 
 # --- DDP-aware DataLoader builder for RegPairsDataset ---
 from torch.utils.data import DataLoader
@@ -313,6 +281,7 @@ def create_reg_pairs_loaders_ddp(
     target_size=None,
     distributed: bool = False,
 ):
+    assert target_size is not None, "target_size must be provided to ensure fixed and moving images are resampled to the same shape for aligned patch grids"
     train_ds = RegPairsDataset(
         train_pairs_csv,
         patch_size=patch_size,
@@ -344,6 +313,7 @@ def create_reg_pairs_loaders_ddp(
         pin_memory=True,
         drop_last=True,
         persistent_workers=(num_workers > 0),
+        worker_init_fn=_worker_init_fn if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds,
@@ -353,6 +323,7 @@ def create_reg_pairs_loaders_ddp(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False,
+        worker_init_fn=_worker_init_fn if num_workers > 0 else None,
         persistent_workers=(num_workers > 0),
     )
     return train_loader, val_loader, train_sampler, val_sampler

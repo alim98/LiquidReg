@@ -76,11 +76,8 @@ class LiquidCell3D(nn.Module):
         # Compute raw time constants
         tau_raw = torch.matmul(h, self.W_tau.T) + torch.matmul(u, self.U_tau.T) + self.b_tau
         
-        # Check for extreme values and clamp
-        tau_raw = torch.clamp(tau_raw, -50, 50)
-        
-        # Apply softplus and scale
-        tau = self.min_tau + F.softplus(tau_raw) * (self.max_tau - self.min_tau)
+        # Apply sigmoid to bound tau in [min_tau, max_tau]
+        tau = self.min_tau + torch.sigmoid(tau_raw) * (self.max_tau - self.min_tau)
         
 
         
@@ -141,12 +138,13 @@ class LiquidCell3D(nn.Module):
             return torch.zeros_like(h), torch.zeros(h.shape[0], h.shape[1], 3, device=h.device, dtype=h.dtype)
     
     def _unpack(self, params: torch.Tensor):
-        if params.dim() > 1:
-            params = params[0]
+        if params.dim() == 1:
+            params = params.unsqueeze(0)
+        B = params.shape[0]
         idx = 0
         def take(n):
             nonlocal idx
-            out = params[idx:idx+n]
+            out = params[:, idx:idx+n]
             idx += n
             return out
 
@@ -159,73 +157,32 @@ class LiquidCell3D(nn.Module):
         n_Wo = 3 * self.hidden_dim
         n_bo = 3
 
-        W_h = take(n_Wh).view(self.hidden_dim, self.hidden_dim)
-        U_h = take(n_Uh).view(self.hidden_dim, self.input_dim)
+        W_h = take(n_Wh).view(B, self.hidden_dim, self.hidden_dim)
+        U_h = take(n_Uh).view(B, self.hidden_dim, self.input_dim)
         b_h = take(n_bh)
 
-        W_tau = take(n_Wt).view(self.hidden_dim, self.hidden_dim)
-        U_tau = take(n_Ut).view(self.hidden_dim, self.input_dim)
+        W_tau = take(n_Wt).view(B, self.hidden_dim, self.hidden_dim)
+        U_tau = take(n_Ut).view(B, self.hidden_dim, self.input_dim)
         b_tau = take(n_bt)
 
-        W_out = take(n_Wo).view(3, self.hidden_dim)
+        W_out = take(n_Wo).view(B, 3, self.hidden_dim)
         b_out = take(n_bo)
 
         return W_h, U_h, b_h, W_tau, U_tau, b_tau, W_out, b_out
 
     def forward_functional(self, h: torch.Tensor, u: torch.Tensor, params: torch.Tensor, dt: float = 0.1):
-        W_h, U_h, b_h, W_tau, U_tau, b_tau, W_out, b_out = self._unpack(torch.tanh(params * 0.1))
-        tau_raw = h @ W_tau.T + u @ U_tau.T + b_tau
-        tau = self.min_tau + torch.nn.functional.softplus(tau_raw) * (self.max_tau - self.min_tau)
+        W_h, U_h, b_h, W_tau, U_tau, b_tau, W_out, b_out = self._unpack(params)
+        tau_raw = torch.einsum('bnh,bhk->bnk', h, W_tau) + torch.einsum('bni,bki->bnk', u, U_tau) + b_tau.unsqueeze(1)
+        tau = self.min_tau + torch.sigmoid(tau_raw) * (self.max_tau - self.min_tau)
         tau = torch.clamp(tau, min=1e-6)
-        pre = h @ W_h.T + u @ U_h.T + b_h
+        pre = torch.einsum('bnh,bhk->bnk', h, W_h) + torch.einsum('bni,bki->bnk', u, U_h) + b_h.unsqueeze(1)
         f_h = torch.sigmoid(pre)
         h_dot = -h / tau + f_h
         h_new = h + dt * h_dot
         h_new = torch.nan_to_num(h_new, nan=0.0)
-        v_pre = h_new @ W_out.T + b_out
+        v_pre = torch.einsum('bnh,bkh->bnk', h_new, W_out) + b_out.unsqueeze(1)
         v = torch.tanh(v_pre)
         return h_new, v
-
-    def set_params_from_vector(self, params: torch.Tensor):
-        """
-        Set all parameters from a flat parameter vector.
-        Used for hyper-network conditioning.
-        """
-
-        
-        # Handle batch dimension - use first sample if batched
-        if params.dim() > 1:
-            params = params[0]
-            
-        idx = 0
-        param_shapes = {
-            'W_h': (self.hidden_dim, self.hidden_dim),
-            'U_h': (self.hidden_dim, self.input_dim),
-            'b_h': (self.hidden_dim,),
-            'W_tau': (self.hidden_dim, self.hidden_dim),
-            'U_tau': (self.hidden_dim, self.input_dim),
-            'b_tau': (self.hidden_dim,),
-            'W_out': (3, self.hidden_dim),
-            'b_out': (3,)
-        }
-        
-        for name, shape in param_shapes.items():
-            param = getattr(self, name)
-            numel = param.numel()
-            if idx + numel <= params.numel():
-                # Extract and reshape parameter
-                param_data = params[idx:idx+numel].view(shape)
-                
-                # Check for NaNs and extreme values, then fix them
-                param_data = torch.nan_to_num(param_data, nan=0.0)
-                param_data = torch.clamp(param_data, -100, 100)
-                
-                # Set parameter
-                param.data = param_data
-                idx += numel
-            else:
-                print(f"Warning: Not enough parameters for {name}, skipping")
-
 
 class LiquidODECore(nn.Module):
     """
@@ -273,6 +230,13 @@ class LiquidODECore(nn.Module):
         B, D, H, W, _ = spatial_coords.shape
         N = D * H * W
         
+        if N > 1_000_000:
+            raise RuntimeError(
+                f"LiquidODECore expects patches, not full volumes. "
+                f"Received volume size {D}x{H}x{W} = {N} voxels. "
+                f"Use patch-based training with smaller spatial dimensions."
+            )
+        
         # Reshape spatial coordinates
         coords = spatial_coords.view(B, N, 3)
         
@@ -280,7 +244,7 @@ class LiquidODECore(nn.Module):
         h = torch.zeros(B, N, self.hidden_dim, device=coords.device, dtype=coords.dtype)
         
         # Run liquid dynamics
-        velocities = []
+        velocity = None
         for step in range(self.num_steps):
             try:
                 h, v = self.cell.forward_functional(h, coords, params, dt=self.dt)
@@ -290,17 +254,16 @@ class LiquidODECore(nn.Module):
                 _soft = 50.0
                 h = _soft * torch.tanh(h / _soft)
                 v = _soft * torch.tanh(v / _soft)
-
-                velocities.append(v)
+                
+                velocity = v
             except Exception as e:
                 print(f"[ERROR] Exception in liquid dynamics step {step}: {e}")
                 import traceback
                 traceback.print_exc()
-                # Return zero velocity field if exception occurs
                 return torch.zeros(B, 3, D, H, W, device=coords.device, dtype=coords.dtype)
         
-        # Use final velocity
-        velocity = velocities[-1]
+        if velocity is None:
+            return torch.zeros(B, 3, D, H, W, device=coords.device, dtype=coords.dtype)
         
         # Scale and reshape
         velocity = velocity * self.velocity_scale

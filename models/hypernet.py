@@ -16,40 +16,48 @@ class HyperNet(nn.Module):
     
     def __init__(
         self,
-        input_dim: int = 512,  # Concatenated feature dimension
+        input_dim: int,
         hidden_dim: int = 256,
-        output_dim: int = 50000,  # Approximate parameter count for Liquid ODE
+        output_dim: int = 50000,
         num_layers: int = 2,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
+        param_scale: float = 0.1,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
+        self.param_scale = param_scale
         
-        # Build MLP layers
+        if dropout > 0:
+            import warnings
+            warnings.warn(
+                "Dropout in HyperNet is not recommended with batch_size=1. "
+                "Set dropout=0 or increase batch_size if using dropout.",
+                UserWarning
+            )
+        
         layers = []
         in_features = input_dim
         
         for i in range(num_layers - 1):
-            layers.extend([
+            layer_components = [
                 nn.Linear(in_features, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.ReLU(inplace=True),
-                nn.Dropout(dropout)
-            ])
+            ]
+            if dropout > 0:
+                layer_components.append(nn.Dropout(dropout))
+            layers.extend(layer_components)
             in_features = hidden_dim
         
-        # Final layer
         layers.append(nn.Linear(in_features, output_dim))
         
         self.mlp = nn.Sequential(*layers)
         
-        # Initialize weights
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights with appropriate scales."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.1)
@@ -60,39 +68,36 @@ class HyperNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
     
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """
-        Generate parameters from concatenated image features.
-        
-        Args:
-            features: Concatenated features (B, input_dim)
-            
-        Returns:
-            params: Generated parameters (B, output_dim)
-        """
-        # Generate parameters
         params = self.mlp(features)
-        
-        # Scale parameters to reasonable range
-        params = torch.tanh(params * 0.1)
-        
+        params = torch.tanh(params * self.param_scale)
         return params
 
 
 class FeatureFusion(nn.Module):
     """
     Module for fusing features from fixed and moving images.
+    
+    WARNING: fusion_type="attention" is computationally infeasible for large spatial
+    dimensions (e.g., > 10^4 tokens). Use only with very small feature maps.
     """
     
     def __init__(
         self,
         feature_dim: int = 256,
-        fusion_type: str = "concat_pool",  # Options: concat_pool, attention, gated
+        fusion_type: str = "concat_pool",
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.fusion_type = fusion_type
         
         if fusion_type == "attention":
+            import warnings
+            warnings.warn(
+                "Attention fusion is computationally expensive (O(N^2) memory). "
+                "Only use with very small spatial feature maps (< 10^4 tokens). "
+                "For typical encoders, use 'concat_pool' or 'gated' instead.",
+                UserWarning
+            )
             self.attention = nn.MultiheadAttention(
                 embed_dim=feature_dim,
                 num_heads=8,
@@ -133,20 +138,23 @@ class FeatureFusion(nn.Module):
             fused = F.adaptive_avg_pool3d(feat_concat, 1).view(B, -1)
         
         elif self.fusion_type == "attention":
-            # Reshape for attention
-            feat_fixed_flat = feat_fixed.flatten(2).permute(0, 2, 1)  # (B, N, C)
+            feat_fixed_flat = feat_fixed.flatten(2).permute(0, 2, 1)
             feat_moving_flat = feat_moving.flatten(2).permute(0, 2, 1)
             
-            # Cross-attention
+            N = feat_fixed_flat.shape[1]
+            if N > 10000:
+                raise RuntimeError(
+                    f"Attention fusion with {N} tokens is computationally infeasible. "
+                    f"Use 'concat_pool' or 'gated' fusion instead, or reduce encoder spatial output."
+                )
+            
             attended, _ = self.attention(
                 feat_fixed_flat, 
                 feat_moving_flat, 
                 feat_moving_flat
             )
             attended = self.norm(attended + feat_fixed_flat)
-            
-            # Pool
-            fused = attended.mean(dim=1)  # (B, C)
+            fused = attended.mean(dim=1)
         
         elif self.fusion_type == "gated":
             # Gated fusion

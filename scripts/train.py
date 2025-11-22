@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -28,9 +28,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from utils.ddp import init_distributed, is_main_process, barrier, cleanup, reduce_mean, get_rank, get_world_size, is_distributed
+from utils.ddp import init_distributed, is_main_process, barrier, cleanup, reduce_mean, get_rank, get_world_size
 from models.liquidreg import LiquidReg, LiquidRegLite
-from dataloaders.oasis_dataset import create_oasis_loaders
 from losses.registration_losses import CompositeLoss
 from utils.preprocessing import normalize_volume
 
@@ -40,8 +39,6 @@ try:
     from torchvision.utils import make_grid  # optional; used for multi-slice grids
 except Exception:
     make_grid = None
-
-amp_dtype = torch.bfloat16
 
 def set_seed(seed: int):
     """Set random seeds for reproducibility."""
@@ -322,7 +319,6 @@ class SafeDataset(Dataset):
     def __init__(self, base: Dataset, *, logger: SummaryWriter | None = None, split_name: str = "train"):
         self.base = base
         self.bad = set()
-        self.logger = logger
         self.split = split_name
 
     def __len__(self):
@@ -336,10 +332,6 @@ class SafeDataset(Dataset):
             if idx not in self.bad:
                 self.bad.add(idx)
                 print(f"[WARN] {self.split}: skipping bad sample idx={idx}: {e}")
-                if self.logger is not None:
-                    step = len(self.bad)
-                    self.logger.add_text(f"errors/{self.split}_sample", f"idx={idx} err={e}", step)
-                    self.logger.add_scalar(f"errors/{self.split}_bad_sample_count", len(self.bad), step)
             return None
 
 def safe_collate(batch, *, min_batch: int = 1):
@@ -404,6 +396,7 @@ def train_epoch(
     num_batches = len(train_loader)
 
     dropped_batches = 0
+    ok_batches = 0
     max_dropped = max(5, int(0.2 * num_batches))  # e.g., 20% or at least 5
 
     warmup_epochs = config['training'].get('regularization_warmup_epochs', 25)
@@ -480,14 +473,11 @@ def train_epoch(
         use_amp = config['training']['use_amp']
 
         try:
-            # Try new API first
             from torch.amp import autocast
             amp_dtype = _select_amp_dtype(device)
             autocast_context = autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype)
-        
-        except TypeError:            
+        except Exception:
             from torch.cuda.amp import autocast
-            # old API: omit dtype
             autocast_context = autocast(enabled=use_amp)
         
         try:
@@ -499,13 +489,13 @@ def train_epoch(
                 jacobian_det = output['jacobian_det']
                 liquid_params = output['liquid_params']
                 
-                # Compute losses
+                # Compute losses (force float32 for similarity + regularizers under AMP)
                 losses = criterion(
-                    fixed=fixed,
-                    warped=warped,
-                    velocity_field=velocity,
-                    jacobian_det=jacobian_det,
-                    liquid_params=liquid_params
+                    fixed=fixed.float(),
+                    warped=warped.float(),
+                    velocity_field=velocity.float() if velocity is not None else None,
+                    jacobian_det=jacobian_det.float() if jacobian_det is not None else None,
+                    liquid_params=liquid_params.float() if liquid_params is not None else None,
                 )
                 
                 loss = losses['total']
@@ -513,11 +503,15 @@ def train_epoch(
                 loss_log = reduce_mean(loss.detach())
 
         except Exception as e:
+            if fail_fast:
+                raise
             print(f"[ERROR] Exception in forward pass: {e}")
             import traceback
             traceback.print_exc()
-            # Log error to TB
             writer.add_text("errors/forward", f"epoch={epoch} batch={batch_idx} err={e}", epoch * num_batches + batch_idx)
+            batch_idx += 1
+            pbar.update(1)
+            dropped_batches += 1
             continue
         
         # -------------------- Backward/Step with OOM guard --------------------
@@ -592,6 +586,10 @@ def train_epoch(
                 writer.add_text('errors/oom_detail', f"epoch={epoch} batch={batch_idx} err={e}", step)
 
                 optimizer.zero_grad(set_to_none=True)
+                try:
+                    del loss, losses, output, warped, velocity, jacobian_det, liquid_params
+                except Exception:
+                    pass
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     torch.cuda.reset_peak_memory_stats()
@@ -604,7 +602,9 @@ def train_epoch(
                 optimizer.zero_grad(set_to_none=True)
 
         if oom_this_batch:
-            # skip any per-batch success logging and move to next batch
+            batch_idx += 1
+            pbar.update(1)
+            dropped_batches += 1
             continue
         # ----------------------------------------------------------------------
 
@@ -620,6 +620,8 @@ def train_epoch(
                 total_losses[key] = 0.0
             total_losses[key] += value.item()
         
+        ok_batches += 1
+        
         # Update progress bar
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
@@ -627,39 +629,37 @@ def train_epoch(
             'ips': f"{throughput:.1f}"
         })
         
-        # Log to tensorboard (per step)
+        # Log to tensorboard (per step; rank 0 only)
         if batch_idx % config['logging']['log_interval'] == 0:
-            step = epoch * num_batches + batch_idx
-            writer.add_scalar('train/loss', loss_log.item(), step)
-            writer.add_scalar('train/grad_norm', grad_norm, step)
-            writer.add_scalar('train/iter_time_s', iter_time, step)
-            writer.add_scalar('train/throughput_items_per_s', throughput, step)
-            writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], step)
-            if config['training']['use_amp']:
-                writer.add_scalar('amp/scale', new_scale, step)
-                # overflow heuristic: drop in scale
-                if new_scale < prev_scale:
-                    writer.add_scalar('amp/overflow_events', 1, step)
-            for key, value in losses.items():
-                writer.add_scalar(f'train/{key}', value.item(), step)
+            is_main = not dist.is_initialized() or dist.get_rank() == 0
+            if is_main:
+                step = epoch * num_batches + batch_idx
+                writer.add_scalar('train/loss', loss_log.item(), step)
+                writer.add_scalar('train/grad_norm', grad_norm, step)
+                writer.add_scalar('train/iter_time_s', iter_time, step)
+                writer.add_scalar('train/throughput_items_per_s', throughput, step)
+                writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], step)
+                if config['training']['use_amp']:
+                    writer.add_scalar('amp/scale', new_scale, step)
+                    if new_scale < prev_scale:
+                        writer.add_scalar('amp/overflow_events', 1, step)
+                for key, value in losses.items():
+                    writer.add_scalar(f'train/{key}', value.item(), step)
 
-            # CUDA memory stats (if available)
-            for k, v in _device_mem_stats().items():
-                writer.add_scalar(k, v, step)
+                for k, v in _device_mem_stats().items():
+                    writer.add_scalar(k, v, step)
 
-            # --- richer visualizations & stats ---
-            _add_images(writer, "train/images", fixed, moving, warped, step,
-                        plane="axial", out_hw=384, grid_slices=0)
+                _add_images(writer, "train/images", fixed, moving, warped, step,
+                            plane="axial", out_hw=384, grid_slices=0)
 
-            _field_stats_and_hists(
-                writer, "train/fields",
-                velocity_field=velocity,
-                jacobian_det=jacobian_det,
-                step=step
-            )
+                _field_stats_and_hists(
+                    writer, "train/fields",
+                    velocity_field=velocity,
+                    jacobian_det=jacobian_det,
+                    step=step
+                )
 
-            # Param/grad histograms occasionally
-            _log_param_and_grad_hists(writer, model, step, every_n=max(1, 10 * config['logging']['log_interval']))
+                _log_param_and_grad_hists(writer, model, step, every_n=max(1, 10 * config['logging']['log_interval']))
         
         # Step-wise checkpoint saving
         if checkpoint_callback is not None:
@@ -679,9 +679,10 @@ def train_epoch(
         items = (len(train_loader.dataset) if hasattr(train_loader, "dataset") else (num_batches * bs))
         writer.add_scalar('train/epoch_avg_ips', items / denom, epoch)
 
-    # Average losses
-    avg_losses = {key: value / num_batches for key, value in total_losses.items()} if num_batches > 0 else {}
-    avg_losses['avg_loss'] = total_loss / num_batches if num_batches > 0 else float('inf')
+    # Average losses over successful batches only
+    ok_batches = max(ok_batches, 1)  # Avoid division by zero
+    avg_losses = {key: value / ok_batches for key, value in total_losses.items()} if ok_batches > 0 else {}
+    avg_losses['avg_loss'] = total_loss / ok_batches if ok_batches > 0 else float('inf')
     
     criterion.lambda_jacobian = original_lambda_jacobian
     writer.add_scalar('train/lambda_jacobian_effective', lambda_jacobian_effective, epoch)
@@ -708,6 +709,7 @@ def validate_epoch(
     num_batches = len(val_loader)
     
     dropped_batches = 0
+    ok_batches = 0
     max_dropped = max(5, int(0.2 * num_batches))  # e.g., 20% or at least 5
 
     
@@ -765,11 +767,10 @@ def validate_epoch(
             # Forward pass with mixed precision
             use_amp = config['training']['use_amp']
             try:
-                # Try new API first
                 from torch.amp import autocast
-                autocast_context = autocast(device_type=device.type, enabled=use_amp)
-            except TypeError:
-                # Fallback to old API
+                amp_dtype = _select_amp_dtype(device)
+                autocast_context = autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype)
+            except Exception:
                 from torch.cuda.amp import autocast as cuda_autocast
                 autocast_context = cuda_autocast(enabled=use_amp)
             
@@ -783,37 +784,52 @@ def validate_epoch(
                     liquid_params = output['liquid_params']
                     deformation = output['deformation_field']
 
-                    # ---- Optional Dice logging if labels are in the batch ----
-                    if ('segmentation_fixed' in batch and 'segmentation_moving' in batch
-                        and batch['segmentation_fixed'] is not None and batch['segmentation_moving'] is not None):
+                    # ---- Optional Dice logging (DDP-safe mask for label presence) ----
+                    has_lbl = (
+                        'segmentation_fixed' in batch and 'segmentation_moving' in batch
+                        and batch['segmentation_fixed'] is not None and batch['segmentation_moving'] is not None
+                    )
+
+                    has_lbl_t = torch.tensor(int(has_lbl), device=device)
+                    dice_fg_t = torch.tensor(0.0, device=device)
+
+                    if has_lbl:
                         fseg = batch['segmentation_fixed'].to(device, non_blocking=True).long()  # (N,1,D,H,W)
                         mseg = batch['segmentation_moving'].to(device, non_blocking=True).long()
 
-                        # Binary foreground Dice (quick + robust)
                         ffg = (fseg > 0).float()
                         mfg = (mseg > 0).float()
 
-                        # Make 2-class one-hot [bg, fg]
                         m2 = torch.cat([(1.0 - mfg), mfg], dim=1)  # (N,2,D,H,W)
 
-                        # Use the same transformer as images
-                        w2 = base.spatial_transformer(m2, deformation)  # bilinear ok for probs
-                        wfg = w2[:, 1:2, ...]  # foreground prob
+                        w2 = base.spatial_transformer(m2, deformation)
+                        wfg = w2[:, 1:2, ...]
 
                         eps = 1e-6
                         inter = (wfg * ffg).sum(dim=(1,2,3,4))
                         denom = wfg.sum(dim=(1,2,3,4)) + ffg.sum(dim=(1,2,3,4))
-                        dice_fg = ((2 * inter + eps) / (denom + eps)).mean().item()
-                        writer.add_scalar('val/dice_fg', dice_fg, epoch)
+                        dice_fg = ((2 * inter + eps) / (denom + eps)).mean()
+                        dice_fg_t = dice_fg.detach()
+
+                    if dist.is_initialized():
+                        dist.all_reduce(has_lbl_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(dice_fg_t, op=dist.ReduceOp.SUM)
+
+                    if has_lbl_t.item() > 0:
+                        dice_fg_mean = dice_fg_t / has_lbl_t
+                        step = epoch * num_batches + batch_idx
+                        is_main = not dist.is_initialized() or dist.get_rank() == 0
+                        if is_main:
+                            writer.add_scalar('val/dice_fg', float(dice_fg_mean.item()), step)
 
                     
-                    # Compute losses
+                    # Compute losses (force float32 for similarity + regularizers under AMP)
                     losses = criterion(
-                        fixed=fixed,
-                        warped=warped,
-                        velocity_field=velocity,
-                        jacobian_det=jacobian_det,
-                        liquid_params=liquid_params
+                        fixed=fixed.float(),
+                        warped=warped.float(),
+                        velocity_field=velocity.float() if velocity is not None else None,
+                        jacobian_det=jacobian_det.float() if jacobian_det is not None else None,
+                        liquid_params=liquid_params.float() if liquid_params is not None else None,
                     )
                     
                     loss = losses['total']
@@ -845,14 +861,21 @@ def validate_epoch(
                     total_losses[key] = 0.0
                 total_losses[key] += value.item()
             
+            ok_batches += 1
+            
             pbar.set_postfix({'val_loss': f"{loss.item():.4f}"})
 
-            # Per-batch val logging (only on rank 0, less frequently to save memory)
-            is_main = not dist.is_initialized() or dist.get_rank() == 0
+            # Per-batch val logging (only on rank 0, with reduction only when logging)
             val_log_interval = max(10, config['logging']['log_interval'] * 2)
-            if is_main and batch_idx % val_log_interval == 0:
+            do_log = (batch_idx % val_log_interval == 0)
+            if dist.is_initialized():
+                loss_log = reduce_mean(loss.detach()) if do_log else loss.detach()
+            else:
+                loss_log = loss.detach()
+            is_main = not dist.is_initialized() or dist.get_rank() == 0
+            if is_main and do_log:
                 step = epoch * num_batches + batch_idx
-                writer.add_scalar('val/step_loss', reduce_mean(loss.detach()).item(), step)
+                writer.add_scalar('val/step_loss', loss_log.item(), step)
                 _add_images(writer, "val/images", fixed, moving, warped, step,
                             plane="axial", out_hw=384, grid_slices=0)
                 _field_stats_and_hists(
@@ -866,24 +889,27 @@ def validate_epoch(
             pbar.update(1)
     
     barrier()
-    
+
     if dist.is_initialized():
         device = next(model.parameters()).device
+
         total_loss_tensor = torch.tensor(total_loss, device=device)
+        ok_batches_tensor = torch.tensor(ok_batches, device=device)
+
         dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
-        total_loss = total_loss_tensor.item() / get_world_size()
-        
+        dist.all_reduce(ok_batches_tensor, op=dist.ReduceOp.SUM)
+
+        total_loss = total_loss_tensor.item()
+        ok_batches = ok_batches_tensor.item()
+
         for key in total_losses:
             val_tensor = torch.tensor(total_losses[key], device=device)
             dist.all_reduce(val_tensor, op=dist.ReduceOp.SUM)
-            total_losses[key] = val_tensor.item() / get_world_size()
-        
-        total_batches_tensor = torch.tensor(num_batches, device=device)
-        dist.all_reduce(total_batches_tensor, op=dist.ReduceOp.SUM)
-        num_batches = total_batches_tensor.item()
-    
-    avg_losses = {key: value / num_batches for key, value in total_losses.items()} if num_batches > 0 else {}
-    avg_losses['avg_loss'] = total_loss / num_batches if num_batches > 0 else float('inf')
+            total_losses[key] = val_tensor.item()
+
+    ok_batches = max(ok_batches, 1)
+    avg_losses = {key: value / ok_batches for key, value in total_losses.items()}
+    avg_losses["avg_loss"] = total_loss / ok_batches
     
     is_main = not dist.is_initialized() or dist.get_rank() == 0
     if is_main:
@@ -926,31 +952,30 @@ def save_checkpoint(
     filepath: str,
     is_best: bool = False,
     writer: SummaryWriter = None,
-    step_in_epoch: int = None
+    step_in_epoch: int = None,
+    best_val_loss: float | None = None,
 ):
-    """Save model checkpoint."""
     base = model.module if hasattr(model, "module") else model
     checkpoint = {
         'epoch': epoch,
+        'step_in_epoch': step_in_epoch,
         'model_state_dict': base.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
+        'last_train_loss': float(loss) if step_in_epoch is not None else None,
+        'last_val_loss': float(loss) if step_in_epoch is None else None,
+        'best_val_loss': float(best_val_loss) if best_val_loss is not None else None,
         'config': config,
     }
-    
-    if step_in_epoch is not None:
-        checkpoint['step_in_epoch'] = step_in_epoch
-    
+
     if scheduler is not None:
         checkpoint['scheduler_state_dict'] = scheduler.state_dict()
-    
+
     torch.save(checkpoint, filepath)
-    
+
     if is_best:
         best_path = filepath.replace('.pth', '_best.pth')
         torch.save(checkpoint, best_path)
 
-    # Log checkpoint event
     if writer is not None:
         writer.add_scalar('checkpoints/last_epoch', epoch, epoch)
         writer.add_scalar('checkpoints/last_loss', loss, epoch)
@@ -959,22 +984,7 @@ def save_checkpoint(
             writer.add_text('checkpoints/best_path', str(best_path), epoch)
 
 from pathlib import Path
-import shutil
 
-def _atomic_copy(src: str, dst: str):
-    tmp = f"{dst}.tmp"
-    shutil.copy2(src, tmp)
-    os.replace(tmp, dst)
-
-def _update_ckpt_aliases(checkpoint_path: str, is_best: bool):
-    """Create/overwrite easy-to-find pointers: last.pth and best.pth"""
-    ckpt = Path(checkpoint_path)
-    base = ckpt.parent  # .../checkpoints
-    last_ptr = base / "last.pth"
-    _atomic_copy(str(ckpt), str(last_ptr))
-    if is_best:
-        best_ptr = base / "best.pth"
-        _atomic_copy(str(ckpt), str(best_ptr))
 
 import builtins
 
@@ -1037,6 +1047,9 @@ def main():
     
     # Fail fast
     FAIL_FAST = bool(args.fail_fast)
+    if is_ddp and not FAIL_FAST:
+        print("[DDP] Forcing fail_fast=True to avoid rank desync.")
+        FAIL_FAST = True
     
     # Override seed if provided
     if args.seed is not None:
@@ -1103,35 +1116,37 @@ def main():
     writer = SummaryWriter((log_dir / 'tensorboard' / f"rank{rank}"))
 
 
-    # Log config & hparams up front
-    try:
-        writer.add_text('config/yaml', f"```\n{yaml.dump(config)}\n```", 0)
-        # hparams: keep it simple (avoid nested dicts)
-        flat_hparams = {
-            'model_name': config['model']['name'],
-            'image_size': str(tuple(config['model']['image_size'])),
-            'optimizer': config['training']['optimizer'],
-            'lr': config['training']['learning_rate'],
-            'weight_decay': config['training']['weight_decay'],
-            'scheduler': str(config['training']['scheduler']),
-            'batch_size': config['data']['batch_size'],
-            'patch_size': int(config['data']['patch_size']),
-            'use_amp': int(config['training']['use_amp']),
-        }
-        # add_hparams logs a special summary; provide a dummy metric to render
-        writer.add_hparams(flat_hparams, {'hparams/placeholder_metric': 0.0})
-    except Exception:
-        pass
+    # Log config & hparams up front (main process only)
+    if main_process:
+        try:
+            writer.add_text('config/yaml', f"```\n{yaml.dump(config)}\n```", 0)
+            flat_hparams = {
+                'model_name': config['model']['name'],
+                'image_size': str(tuple(config['model']['image_size'])),
+                'optimizer': config['training']['optimizer'],
+                'lr': config['training']['learning_rate'],
+                'weight_decay': config['training']['weight_decay'],
+                'scheduler': str(config['training']['scheduler']),
+                'batch_size': config['data']['batch_size'],
+                'patch_size': int(config['data']['patch_size']),
+                'use_amp': int(config['training']['use_amp']),
+            }
+            writer.add_hparams(flat_hparams, {'hparams/placeholder_metric': 0.0})
+        except Exception:
+            pass
     
     # Create data loaders
     from dataloaders.reg_pairs_dataset import create_reg_pairs_loaders_ddp
 
-    assert args.train_pairs and args.val_pairs, \
-        "This project now trains on pairs CSVs. Provide --train_pairs and --val_pairs."
+    train_pairs_csv = args.train_pairs or config['data'].get('train_pairs')
+    val_pairs_csv = args.val_pairs or config['data'].get('val_pairs')
+    
+    assert train_pairs_csv and val_pairs_csv, \
+        "train_pairs and val_pairs must be provided via --train_pairs/--val_pairs or config['data']['train_pairs']/config['data']['val_pairs']"
 
     train_loader, val_loader, train_sampler, val_sampler = create_reg_pairs_loaders_ddp(
-        train_pairs_csv=args.train_pairs,
-        val_pairs_csv=args.val_pairs,
+        train_pairs_csv=train_pairs_csv,
+        val_pairs_csv=val_pairs_csv,
         batch_size=config['data']['batch_size'],
         patch_size=config['data']['patch_size'],
         patch_stride=config['data']['patch_stride'],
@@ -1145,6 +1160,9 @@ def main():
 
     from torch.utils.data.distributed import DistributedSampler
     
+    if args.small_dataset and is_ddp:
+        raise RuntimeError("--small_dataset is not supported with DDP (each rank would sample different subset).")
+
     if args.small_dataset:
         print("Using small dataset (1 percent of the full dataset)")
 
@@ -1194,7 +1212,7 @@ def main():
     writer.add_scalar('data/train_batches', len(train_loader), 0)
     writer.add_scalar('data/val_batches', len(val_loader), 0)
 
-    if not FAIL_FAST:
+    if (not FAIL_FAST) and (not is_ddp):
         train_loader = make_safe_loader(train_loader, split_name="train", logger=writer,
                                         num_workers=config['data']['num_workers'], sampler=train_sampler)
         val_loader   = make_safe_loader(val_loader,   split_name="val",   logger=writer,
@@ -1212,19 +1230,19 @@ def main():
             print("[DDP] Converted BatchNorm to SyncBatchNorm")
         model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None,
                     output_device=local_rank if device.type == "cuda" else None,
-                    find_unused_parameters=True)
+                    find_unused_parameters=False)
 
     
-    # Try to log the model graph (best-effort)
-    try:
-        # Create tiny dummy inputs matching expected shape: (N=1,C=1,D,H,W) or (N,C,H,W)
-        img_sz = config['model']['image_size']
-        shape = (1, 1, *img_sz) if len(img_sz) == 3 else (1, 1, *img_sz[-2:])
-        dummy_fixed  = torch.zeros(shape, device=device)
-        dummy_moving = torch.zeros(shape, device=device)
-        writer.add_graph(model, (dummy_fixed, dummy_moving), use_strict_trace=False)
-    except Exception:
-        pass
+    # Try to log the model graph (best-effort, main process only)
+    if main_process:
+        try:
+            img_sz = config['model']['image_size']
+            shape = (1, 1, *img_sz) if len(img_sz) == 3 else (1, 1, *img_sz[-2:])
+            dummy_fixed  = torch.zeros(shape, device=device)
+            dummy_moving = torch.zeros(shape, device=device)
+            writer.add_graph(model, (dummy_fixed, dummy_moving), use_strict_trace=False)
+        except Exception:
+            pass
 
     # Enable gradient checkpointing if requested (DDP-safe)
     if args.gradient_checkpointing:
@@ -1266,13 +1284,14 @@ def main():
     )
     
     # Mixed precision scaler
-    if config['training']['use_amp'] and device.type == 'cuda':
-        # Try new API first
+    use_amp = config['training']['use_amp']
+    if use_amp and device.type == 'cuda':
+        amp_dtype = _select_amp_dtype(device)
         try:
             from torch.amp import GradScaler as AmpGradScaler
         except Exception:
             from torch.cuda.amp import GradScaler as AmpGradScaler
-        scaler = AmpGradScaler(enabled=(use_amp and amp_dtype is torch.float16))
+        scaler = AmpGradScaler(enabled=use_amp)
     else:
         # For CPU or when AMP is disabled, create a dummy scaler
         class DummyScaler:
@@ -1292,20 +1311,19 @@ def main():
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
-        (model.module if hasattr(model, "module") else model).load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        if 'scheduler_state_dict' in ckpt and scheduler is not None:
-            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-        if 'epoch' in ckpt:
-            start_epoch = int(ckpt['epoch'])
-            if 'step_in_epoch' in ckpt and ckpt['step_in_epoch'] is not None:
-                start_step_in_epoch = int(ckpt['step_in_epoch'])
-                print(f"Resumed from mid-epoch checkpoint: epoch={start_epoch}, step={start_step_in_epoch}")
-            else:
-                start_epoch += 1
-                start_step_in_epoch = 0
-        if 'loss' in ckpt:
-            best_loss = float(ckpt['loss'])
+        base = model.module if hasattr(model, "module") else model
+        base.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+
+        best_loss = float(ckpt.get("best_val_loss") or float("inf"))
+        start_epoch = int(ckpt.get("epoch", 0))
+        start_step_in_epoch = int(ckpt.get("step_in_epoch") or 0)
+
+        if start_step_in_epoch == 0:
+            start_epoch += 1
+
         print(f"Resumed from {args.resume} (start_epoch={start_epoch}, start_step={start_step_in_epoch}, best_loss={best_loss:.4f})")
 
     # Setup signal handler for graceful shutdown
@@ -1407,9 +1425,9 @@ def main():
             if main_process and (epoch % config['logging']['save_interval'] == 0 or is_best):
                 checkpoint_path = checkpoint_dir / f'epoch_{epoch}.pth'
                 save_checkpoint(
-                    model, optimizer, scheduler, epoch, current_loss, 
+                    model, optimizer, scheduler, epoch, current_loss,
                     config, str(checkpoint_path), is_best, writer,
-                    step_in_epoch=None
+                    step_in_epoch=None, best_val_loss=best_loss,
                 )
                 current_step[0] = 0
             
@@ -1421,9 +1439,11 @@ def main():
                 break
         
         # Update scheduler
+        did_val = (epoch % config['validation']['eval_interval'] == 0)
         if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-            mon = 'similarity' if 'val_losses' in locals() and 'similarity' in val_losses else 'avg_loss'
-            scheduler.step(val_losses[mon] if 'val_losses' in locals() else train_losses['avg_loss'])
+            if did_val and 'val_losses' in locals():
+                mon = 'similarity' if 'similarity' in val_losses else 'avg_loss'
+                scheduler.step(val_losses[mon])
         else:
             scheduler.step()
 
@@ -1435,11 +1455,12 @@ def main():
     # Save final model
     if main_process:
         final_path = checkpoint_dir / 'final_model.pth'
+        final_loss = val_losses['avg_loss'] if 'val_losses' in locals() else train_losses['avg_loss']
         save_checkpoint(
-            model, optimizer, scheduler, epoch, 
-            val_losses['avg_loss'] if 'val_losses' in locals() else train_losses['avg_loss'], 
+            model, optimizer, scheduler, epoch,
+            final_loss,
             config, str(final_path), False, writer,
-            step_in_epoch=None
+            step_in_epoch=None, best_val_loss=best_loss,
         )
     
     # writer.close()

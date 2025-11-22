@@ -12,7 +12,7 @@ from utils.preprocessing import normalize_volume
 from utils.patch_utils import extract_patches, PatchAugmentor
 
 
-def _read_pairs_csv(csv_path: Path) -> List[Tuple[int, int]]:
+def _read_pairs_csv_ids(csv_path: Path) -> List[Tuple[int, int]]:
     pairs: List[Tuple[int, int]] = []
     if not csv_path or not csv_path.exists():
         return pairs
@@ -42,7 +42,6 @@ class L2RTask3Dataset(Dataset):
         augment: bool = False,
         use_labels: bool = True,
         pairs_csv: Optional[str] = None,
-        fixed_pairs: bool = False,
         seed: int = 42,
     ) -> None:
         self.data_dir = Path(data_dir)
@@ -62,6 +61,9 @@ class L2RTask3Dataset(Dataset):
         else:
             self.augmentor = None
 
+        from collections import OrderedDict
+        self._volume_cache = OrderedDict()
+        self._volume_cache_max = 32
         
         self.volumes = self._discover_volumes()
 
@@ -139,7 +141,7 @@ class L2RTask3Dataset(Dataset):
 
     
     def _pairs_from_csv(self) -> List[Tuple[int, int]]:
-        csv_pairs = _read_pairs_csv(self.pairs_csv)
+        csv_pairs = _read_pairs_csv_ids(self.pairs_csv)
         id_to_idx = {v["id"]: i for i, v in enumerate(self.volumes)}
         pairs: List[Tuple[int, int]] = []
         for fid, mid in csv_pairs:
@@ -161,11 +163,25 @@ class L2RTask3Dataset(Dataset):
 
     
     def _load_volume(self, info: dict) -> dict:
-        img = nib.load(str(info["image"])).get_fdata().astype(np.float32)
+        img_path = str(info["image"])
+        label_path = str(info["label"]) if info.get("label") else None
+        
+        cache_key = (img_path, label_path)
+        if cache_key in self._volume_cache:
+            cached = self._volume_cache.pop(cache_key)
+            self._volume_cache[cache_key] = cached
+            return cached
+        
+        img = nib.load(img_path).get_fdata().astype(np.float32)
         label = None
-        if self.use_labels and info.get("label") and Path(info["label"]).exists():
-            label = nib.load(str(info["label"])).get_fdata().astype(np.int32)
-        return {"image": img, "label": label}
+        if self.use_labels and label_path and Path(label_path).exists():
+            label = nib.load(label_path).get_fdata().astype(np.int32)
+        
+        result = {"image": img, "label": label}
+        self._volume_cache[cache_key] = result
+        if len(self._volume_cache) > self._volume_cache_max:
+            self._volume_cache.popitem(last=False)
+        return result
 
     
     def __len__(self) -> int:
@@ -214,30 +230,35 @@ class L2RTask3Dataset(Dataset):
         # This avoids wasting training iterations on empty background patches.
         # ------------------------------------------------------------------
 
-        def _is_valid(p: torch.Tensor, frac: float = 0.10, thresh: float = 0.15) -> bool:
-            """Return True if at least *frac* voxels are > *thresh*."""
+        def _is_valid(p: torch.Tensor) -> bool:
             try:
                 if p.dtype in [torch.long, torch.int32, torch.int64, torch.int, torch.int8, torch.int16]:
-                    # For integer data (segmentation data), check if there are enough non-zero voxels
-                    return (p > 0).float().mean().item() > frac
+                    return (p > 0).float().mean().item() > 0.10
                 else:
-                    # For floating point data (intensity data), use threshold
-                    return (p > thresh).float().mean().item() > frac
+                    pm = p.float()
+                    p_flat = pm.flatten()
+                    if p_flat.numel() == 0:
+                        return False
+                    p10 = torch.quantile(p_flat, 0.10).item()
+                    p90 = torch.quantile(p_flat, 0.90).item()
+                    return (p90 - p10) > 1e-6
             except Exception as e:
-                # Fallback: consider patch valid
                 print(f"Warning: Error in patch validation ({e}), considering patch valid")
                 return True
 
-        max_attempts = 20
-        patch_idx = None
-        for _ in range(max_attempts):
-            cand_idx = random.randint(0, max_valid_idx)
-            if _is_valid(fixed_patches[cand_idx]) and _is_valid(moving_patches[cand_idx]):
-                patch_idx = cand_idx
-                break
+        patch_offset = idx % self.patches_per_pair
+        valid_indices = [
+            i for i in range(max_valid_idx + 1)
+            if _is_valid(fixed_patches[i]) and _is_valid(moving_patches[i])
+        ]
+        
+        if not valid_indices:
+            valid_indices = list(range(max_valid_idx + 1))
 
-        if patch_idx is None:  # fallback if no suitable patch found
-            patch_idx = random.randint(0, max_valid_idx)
+        if self.augment:
+            patch_idx = random.choice(valid_indices)
+        else:
+            patch_idx = valid_indices[patch_offset % len(valid_indices)]
 
         fixed_patch = fixed_patches[patch_idx]
         moving_patch = moving_patches[patch_idx]
@@ -259,10 +280,10 @@ class L2RTask3Dataset(Dataset):
             seed = torch.randint(0, 1000000, (1,)).item()
             
             # Set same random seed for both augmentations to ensure same transforms
-            torch.manual_seed(seed)
+            random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
             output["fixed"] = self.augmentor.augment(fixed_patch)  # Keep channel dimension
             
-            torch.manual_seed(seed)  # Reset to same seed
+            random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
             output["moving"] = self.augmentor.augment(moving_patch)  # Keep channel dimension
 
         # Attach segmentation labels if available
@@ -329,12 +350,20 @@ def create_task3_loaders(
         pairs_csv=str(pairs_csv) if pairs_csv else None,
     )
     
+    def _worker_init_fn(worker_id: int):
+        base_seed = 42
+        worker_seed = base_seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
+        worker_init_fn=_worker_init_fn if num_workers > 0 else None,
     )
     
     val_loader = torch.utils.data.DataLoader(
@@ -343,6 +372,7 @@ def create_task3_loaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        worker_init_fn=_worker_init_fn if num_workers > 0 else None,
     )
 
     test_loader = None
@@ -362,6 +392,7 @@ def create_task3_loaders(
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
+            worker_init_fn=_worker_init_fn if num_workers > 0 else None,
         )
 
     return train_loader, val_loader, test_loader

@@ -50,13 +50,15 @@ class LiquidReg(nn.Module):
         else:
             raise NotImplementedError(f"Encoder type {encoder_type} not implemented")
         
-        # Feature fusion
+        if fusion_type in ["attention", "gated"]:
+            assert encoder_channels == self.encoder.output_channels, \
+                f"For {fusion_type} fusion, encoder_channels ({encoder_channels}) must match encoder output_channels ({self.encoder.output_channels})"
+        
         self.fusion = FeatureFusion(
             feature_dim=encoder_channels,
             fusion_type=fusion_type
         )
         
-        # Calculate fusion output dimension
         if fusion_type == "concat_pool":
             fusion_dim = encoder_channels * 2
         else:
@@ -85,24 +87,21 @@ class LiquidReg(nn.Module):
         # Spatial transformer
         self.spatial_transformer = SpatialTransformer()
         
-        # Generate coordinate grids - will be dynamically generated in forward pass
-        # based on actual input dimensions
+        self._grid_cache = {}
         
-    def _generate_coordinate_grid(self, size: Tuple[int, int, int]) -> torch.Tensor:
-        """Generate normalized coordinate grid for the image."""
+    def _generate_coordinate_grid(self, size: Tuple[int, int, int], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Generate normalized coordinate grid for the image (cached per size/device/dtype)."""
+        key = (size, str(device), dtype)
+        if key in self._grid_cache:
+            return self._grid_cache[key]
+        
         D, H, W = size
-        
-        # Create coordinate vectors
-        d = torch.linspace(-1, 1, D)
-        h = torch.linspace(-1, 1, H)
-        w = torch.linspace(-1, 1, W)
-        
-        # Create meshgrid
+        d = torch.linspace(-1, 1, D, device=device, dtype=dtype)
+        h = torch.linspace(-1, 1, H, device=device, dtype=dtype)
+        w = torch.linspace(-1, 1, W, device=device, dtype=dtype)
         grid_d, grid_h, grid_w = torch.meshgrid(d, h, w, indexing='ij')
-        
-        # Stack coordinates (D, H, W, 3)
         coord_grid = torch.stack([grid_w, grid_h, grid_d], dim=-1)
-        
+        self._grid_cache[key] = coord_grid
         return coord_grid
     
     def forward(
@@ -142,22 +141,14 @@ class LiquidReg(nn.Module):
         liquid_params = self.hyper_net(fused_features)
         
         # Generate coordinate grid based on actual input dimensions
-        coord_grid = self._generate_coordinate_grid((D, H, W)).to(fixed.device)
+        coord_grid = self._generate_coordinate_grid((D, H, W), fixed.device, fixed.dtype)
         coord_grid = coord_grid.unsqueeze(0).expand(B, -1, -1, -1, -1)
         
-        # Generate velocity field using liquid ODE
+        # Generate velocity field using liquid ODE (already scaled by velocity_scale inside core)
         velocity_field = self.liquid_core(coord_grid, liquid_params)
-        
-        # Compute deformation field via scaling & squaring
-        # Convert normalized velocity to voxel units before S&S
-        B, _, D, H, W = fixed.shape  # fixed: [B,1,D,H,W]
-        v = velocity_field
-        v_vox = torch.empty_like(v)
-        v_vox[:, 0] = v[:, 0] * (W / 2.0)  # x uses width
-        v_vox[:, 1] = v[:, 1] * (H / 2.0)  # y uses height
-        v_vox[:, 2] = v[:, 2] * (D / 2.0)  # z uses depth
 
-        deformation_field = self.scaling_squaring(v_vox)
+        # Compute deformation field directly from normalized velocity via scaling & squaring
+        deformation_field = self.scaling_squaring(velocity_field)
 
         
         # Warp moving image
@@ -289,19 +280,21 @@ class LiquidRegLite(nn.Module):
         # Spatial transformer
         self.spatial_transformer = SpatialTransformer()
         
-        # Coordinate grids will be generated dynamically in forward pass
+        self._grid_cache = {}
     
-    def _generate_coordinate_grid(self, size: Tuple[int, int, int]) -> torch.Tensor:
-        """Generate normalized coordinate grid."""
+    def _generate_coordinate_grid(self, size: Tuple[int, int, int], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Generate normalized coordinate grid (cached per size/device/dtype)."""
+        key = (size, str(device), dtype)
+        if key in self._grid_cache:
+            return self._grid_cache[key]
+        
         D, H, W = size
-        
-        d = torch.linspace(-1, 1, D)
-        h = torch.linspace(-1, 1, H)
-        w = torch.linspace(-1, 1, W)
-        
+        d = torch.linspace(-1, 1, D, device=device, dtype=dtype)
+        h = torch.linspace(-1, 1, H, device=device, dtype=dtype)
+        w = torch.linspace(-1, 1, W, device=device, dtype=dtype)
         grid_d, grid_h, grid_w = torch.meshgrid(d, h, w, indexing='ij')
         coord_grid = torch.stack([grid_w, grid_h, grid_d], dim=-1)
-        
+        self._grid_cache[key] = coord_grid
         return coord_grid
     
     def forward(
@@ -325,20 +318,12 @@ class LiquidRegLite(nn.Module):
         liquid_params = self.hyper_net(fused_features)
         
         # Generate coordinate grid based on actual input dimensions
-        coord_grid = self._generate_coordinate_grid((D, H, W)).to(fixed.device)
+        coord_grid = self._generate_coordinate_grid((D, H, W), fixed.device, fixed.dtype)
         coord_grid = coord_grid.unsqueeze(0).expand(B, -1, -1, -1, -1)
         
-        # Generate velocity and deformation fields
+        # Generate velocity and deformation fields (velocity already scaled by velocity_scale)
         velocity_field = self.liquid_core(coord_grid, liquid_params)
-        # Convert normalized velocity to voxel units before S&S
-        B, _, D, H, W = fixed.shape  # fixed: [B,1,D,H,W]
-        v = velocity_field
-        v_vox = torch.empty_like(v)
-        v_vox[:, 0] = v[:, 0] * (W / 2.0)  # x uses width
-        v_vox[:, 1] = v[:, 1] * (H / 2.0)  # y uses height
-        v_vox[:, 2] = v[:, 2] * (D / 2.0)  # z uses depth
-
-        deformation_field = self.scaling_squaring(v_vox)
+        deformation_field = self.scaling_squaring(velocity_field)
 
         
         # Warp image

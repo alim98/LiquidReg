@@ -5,12 +5,14 @@
 # -------- Model --------
 model:
   name: "LiquidReg"
+  # image_size: Target size for resampling volumes before patch extraction (not patch size)
+  # Volumes are resampled to this size, then patches of size patch_size are extracted
   image_size: [96, 96, 96]        # Reduced from 128
   encoder_type: "cnn"
   encoder_channels: 128            # Reduced from 256
   liquid_hidden_dim: 32            # Reduced from 64
   liquid_num_steps: 5               # Reduced from 10
-  velocity_scale: 1.0
+  velocity_scale: 10.0
   num_squaring: 4                   # Reduced from 6
   fusion_type: "concat_pool"
 
@@ -33,7 +35,6 @@ data:
 
   use_labels_train: true
   use_labels_val:   true
-  image_size: [96, 96, 96]         # Reduced from 128
 
 # -------- Training --------
 training:

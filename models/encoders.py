@@ -165,7 +165,7 @@ class SimpleCNN3DEncoder(nn.Module):
             
             layers.extend([
                 nn.Conv3d(current_channels, next_channels, 3, 2, 1),
-                nn.BatchNorm3d(next_channels),
+                nn.InstanceNorm3d(next_channels),
                 nn.ReLU(inplace=True),
             ])
 
