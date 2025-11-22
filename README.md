@@ -1,5 +1,6 @@
 # LiquidReg
-
+Normal mode: ./launch_LiquidReg_training_clr.sh
+Debug mode (5% data): ./launch_LiquidReg_training_clr.sh --debug or ./launch_LiquidReg_training_clr.sh --debug-5pct
 **One command to run everything:**
 
 ```bash

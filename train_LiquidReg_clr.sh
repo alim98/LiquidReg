@@ -8,7 +8,7 @@
 #SBATCH --mem=300000
 #SBATCH --constraint=gpu
 #SBATCH --gres=gpu:a100:4
-#SBATCH --time=1:00:00
+#SBATCH --time=23:00:00
 #SBATCH --mail-user=ali.mikaeili@brain.mpg.de
 module purge
 module load anaconda/3/2023.03
